@@ -2,7 +2,7 @@
 // Every action runs the installed `glidelapse` program on the open folder through the
 // `glidelapse_run` command. While it runs, RapidRAW's sidecar writes are refused
 // (glidelapse::guarded) and an overlay blocks the window; afterwards the folder is reopened.
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -19,7 +19,6 @@ import { Mask } from './Masks';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useLibraryStore } from '../../../store/useLibraryStore';
 import { useUIStore } from '../../../store/useUIStore';
-import { useSettingsStore } from '../../../store/useSettingsStore';
 import { debouncedSave, useEditorActions } from '../../../hooks/useEditorActions';
 import { INITIAL_MASK_ADJUSTMENTS, INITIAL_MASK_CONTAINER } from '../../../utils/adjustments';
 import { createSubMask } from '../../../utils/maskUtils';
@@ -42,6 +41,47 @@ const useRun = create<{
 const say = (line: string) => useRun.setState((s) => ({ log: [...s.log.slice(-199), line] }));
 listen<string>('glidelapse-log', (e) => say(e.payload));
 
+const stop = () => {
+  useRun.setState({ stopped: true });
+  invoke('glidelapse_cancel').catch((e) => say(String(e)));
+};
+
+/**
+ * While an action runs nothing in RapidRAW can be clicked: no edit, selection or file operation
+ * can interfere with what glidelapse writes. Rendered by App.tsx, so switching panels (or the
+ * keyboard shortcut for it) cannot take it away.
+ */
+export function TimelapseOverlay() {
+  const { t } = useTranslation();
+  const { busy, log } = useRun();
+  const box = useRef<HTMLDivElement>(null);
+  // keyboard shortcuts too (panels, ratings, undo): RapidRAW's listeners never see a key; only
+  // Enter/Space on the focused Stop button keep their default action, and focus stays there
+  useEffect(() => {
+    if (!busy) return;
+    const block = (e: KeyboardEvent) => {
+      e.stopImmediatePropagation();
+      if (e.key === 'Tab' || !box.current?.contains(e.target as Node)) e.preventDefault();
+    };
+    window.addEventListener('keydown', block, true);
+    return () => window.removeEventListener('keydown', block, true);
+  }, [busy]);
+  if (!busy) return null;
+  return createPortal(
+    <div ref={box} className="fixed inset-0 z-[1000] bg-black/60 flex items-center justify-center">
+      <div className="bg-surface rounded-md p-4 flex flex-col gap-2 w-[32rem] max-w-[90vw]">
+        <Text variant={TextVariants.small} className="whitespace-pre-wrap break-all max-h-64 overflow-y-auto font-mono">
+          {log.slice(-12).join('\n')}
+        </Text>
+        <Button autoFocus onClick={stop}>
+          {t('editor.timelapse.stop')}
+        </Button>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 export default function TimelapsePanel() {
   const { t } = useTranslation();
   const adjustments = useEditorStore((s) => s.adjustments);
@@ -51,13 +91,11 @@ export default function TimelapsePanel() {
   const selectedPath = useEditorStore((s) => s.selectedImage?.path);
   const originalSize = useEditorStore((s) => s.originalSize);
   const { busy, log, preview } = useRun();
-  // with XMP sync RapidRAW rewrites sidecars while it merely lists or opens photos
-  const xmpSync = useSettingsStore((s) => s.appSettings?.enableXmpSync === true);
   const [keyframes, setKeyframes] = useState(5);
   const [smoothing, setSmoothing] = useState(0.5);
   const [jobs, setJobs] = useState(2);
 
-  const usable = !!folder && !folder.startsWith('Album: ') && !busy && !xmpSync;
+  const usable = !!folder && !folder.startsWith('Album: ') && !busy;
   const hasReference = (adjustments.masks || []).some((m) => m.id === REFERENCE_ID);
   // virtual copies share the photo's file; glidelapse works on files and their sidecars
   const referenceFile = selectedPath && !selectedPath.includes('?vc=') ? selectedPath.split('/').pop() : undefined;
@@ -97,11 +135,6 @@ export default function TimelapsePanel() {
     } finally {
       useRun.setState({ busy: false });
     }
-  };
-
-  const stop = () => {
-    useRun.setState({ stopped: true });
-    invoke('glidelapse_cancel').catch((e) => say(String(e)));
   };
 
   // a radial mask in the middle of the visible (cropped) photo, selected in the Masks panel to be
@@ -253,7 +286,6 @@ export default function TimelapsePanel() {
           value={jobs}
           onChange={(e) => setJobs(Number(e.target.value))}
         />
-        {xmpSync && <Text variant={TextVariants.small}>{t('editor.timelapse.xmpSync')}</Text>}
         {!busy && log.length > 0 && (
           <Text
             variant={TextVariants.small}
@@ -262,23 +294,6 @@ export default function TimelapsePanel() {
             {log.slice(-8).join('\n')}
           </Text>
         )}
-        {/* while an action runs nothing in RapidRAW can be clicked: no edit, selection or file
-          operation can interfere with what glidelapse writes */}
-        {busy &&
-          createPortal(
-            <div className="fixed inset-0 z-[1000] bg-black/60 flex items-center justify-center">
-              <div className="bg-surface rounded-md p-4 flex flex-col gap-2 w-[32rem] max-w-[90vw]">
-                <Text
-                  variant={TextVariants.small}
-                  className="whitespace-pre-wrap break-all max-h-64 overflow-y-auto font-mono"
-                >
-                  {log.slice(-12).join('\n')}
-                </Text>
-                <Button onClick={stop}>{t('editor.timelapse.stop')}</Button>
-              </div>
-            </div>,
-            document.body,
-          )}
       </div>
     </div>
   );

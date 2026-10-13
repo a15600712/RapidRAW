@@ -30,7 +30,7 @@ import MetadataPanel from './components/panel/right/MetadataPanel';
 import CropPanel from './components/panel/right/CropPanel';
 import MasksPanel from './components/panel/right/MasksPanel';
 import AIPanel from './components/panel/right/AIPanel';
-import TimelapsePanel from './components/panel/right/TimelapsePanel';
+import TimelapsePanel, { TimelapseOverlay } from './components/panel/right/TimelapsePanel';
 import PresetsPanel from './components/panel/right/PresetsPanel';
 import TetheringPanel from './components/panel/right/TetheringPanel';
 
@@ -1093,6 +1093,7 @@ const AppWrapper = () => {
     <ContextMenuProvider>
       <App />
       <GlobalTooltip />
+      <TimelapseOverlay />
     </ContextMenuProvider>
   );
 };

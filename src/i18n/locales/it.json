@@ -832,8 +832,7 @@
       "setReference": "Set reference area",
       "smoothing": "Smoothing",
       "stop": "Stop",
-      "title": "Timelapse",
-      "xmpSync": "Turn off XMP sync in RapidRAW's settings to use the Timelapse tools: with it, RapidRAW rewrites sidecars while it lists or opens photos."
+      "title": "Timelapse"
     }
   },
   "export": {

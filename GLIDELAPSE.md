@@ -24,12 +24,15 @@ Changes (2026-10-13/14, on top of v1.6.5):
   sequence played in the panel (written to RapidRAW's cache folder, `$APPCACHE/glidelapse/`,
   which `tauri.conf.json` adds to the asset protocol scope), set keyframes, ramp, holy grail, a
   deflicker reference area drawn as a hidden radial mask on the photo, deflicker, editable mask
-  layers, export video, and the number of parallel jobs. Each action runs the installed `glidelapse` program through the
+  layers, export video, and the number of parallel jobs. Each action runs the installed
+  `glidelapse` program through the
   new commands `glidelapse_run` / `glidelapse_cancel` (`glidelapse.rs`). While it runs an overlay
-  blocks the window and RapidRAW's sidecar-writing commands are refused (`glidelapse::guarded`
-  wraps the command handler in `lib.rs`); afterwards `App.tsx` reopens the folder. Actions are
-  disabled while XMP sync is on. New UI texts are in all locale files (English).
-- `launch_request.rs`: parses `--max-size` and `--cache-dir`; `export_processing.rs`: hands such exports to the
+  (rendered by `App.tsx`) blocks the window and its keyboard shortcuts, and RapidRAW's
+  sidecar-writing commands are refused (`glidelapse::guarded` wraps the command handler in
+  `lib.rs`); afterwards `App.tsx` reopens the folder. New UI texts are in all locale files
+  (English).
+- `launch_request.rs`: parses `--max-size` and `--cache-dir`; `export_processing.rs`: hands such
+  exports to the
   module above and lets it call the export pipeline; `lib.rs`: declares it.
 
 Measured on a laptop (24 MP Nikon NEF, Intel Iris Xe): about 1.2 s per 1024 px measurement image
