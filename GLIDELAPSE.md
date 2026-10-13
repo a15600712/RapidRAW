@@ -13,9 +13,14 @@ Changes (2026-10-13, on top of v1.6.5):
   reduced size; images with colour or luminance masks go through the export pipeline itself and
   are reduced afterwards. Results are 16-bit TIFFs `<output>/<file name>.tiff`; duplicate file
   names, `--adjustments` together with `--max-size`, and crops too thin to reduce are refused.
-- `launch_request.rs`: parses `--max-size`; `export_processing.rs`: hands such exports to the
+- `--cache-dir <dir>` (with `--max-size`): keeps each image's reduced pre-GPU image there and
+  reuses it when the same file is rendered again with the same decoding settings and the same
+  adjustments apart from masks (the key also covers this build and the file's identity; entries
+  carry a checksum and are written atomically). GlideLapse's deflicker renders every frame
+  several times with only its correction mask changed, so each RAW is decoded once.
+- `launch_request.rs`: parses `--max-size` and `--cache-dir`; `export_processing.rs`: hands such exports to the
   module above and lets it call the export pipeline; `lib.rs`: declares it.
 
 Measured on a laptop (24 MP Nikon NEF, Intel Iris Xe): about 1.2 s per 1024 px measurement image
-instead of about 4.3 s for a full-size export; GlideLapse's 300-frame deflicker took 13 minutes
-instead of 18 with corrections within 0.001 EV of the full-size run.
+instead of about 4.3 s for a full-size export, 0.07 s from the cache; GlideLapse's 300-frame
+deflicker took 5 minutes instead of 18 with corrections within 0.001 EV of the full-size run.

@@ -24,6 +24,8 @@ pub struct HeadlessExportSession {
     pub adjustments_override: Option<String>,
     /// GlideLapse: render at most this many px on the long edge (`--max-size`).
     pub max_size: Option<u32>,
+    /// GlideLapse: keep the reduced images there for reuse (`--cache-dir`, with `--max-size`).
+    pub cache_dir: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +56,7 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
         let mut keep_metadata = false;
         let mut adjustments_override = None;
         let mut max_size = None;
+        let mut cache_dir = None;
 
         if let Some(src) = iter.next()
             && !src.starts_with('-')
@@ -110,10 +113,19 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
                     };
                     max_size = Some(px);
                 }
+                "--cache-dir" => {
+                    let Some(dir) = iter.next() else {
+                        return LaunchRequest::InvalidHeadless("--cache-dir needs a folder.".to_string());
+                    };
+                    cache_dir = Some(dir.clone());
+                }
                 _ => {}
             }
         }
 
+        if cache_dir.is_some() && max_size.is_none() {
+            return LaunchRequest::InvalidHeadless("--cache-dir needs --max-size.".to_string());
+        }
         if max_size.is_some() && adjustments_override.is_some() {
             return LaunchRequest::InvalidHeadless("--adjustments cannot be combined with --max-size.".to_string());
         }
@@ -127,6 +139,7 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
             keep_metadata,
             adjustments_override,
             max_size,
+            cache_dir,
         });
     }
 

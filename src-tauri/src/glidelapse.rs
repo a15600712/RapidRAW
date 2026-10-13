@@ -8,11 +8,16 @@
 //! which sample the full-size image, are rendered by the export pipeline itself and reduced
 //! afterwards. Each result is written as a 16-bit TIFF `<dir>/<file name>.tiff`. GlideLapse's
 //! deflicker measures whole sequences this way instead of one full-size export per frame.
+//!
+//! With `--cache-dir <dir>` the reduced image before the GPU (decoded, composited, geometry
+//! applied) is kept there and reused when the same file is rendered again with the same settings
+//! and the same adjustments apart from masks: the deflicker renders every frame several times
+//! with only its correction mask changed, so the RAW is decoded once instead of every pass.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use image::{DynamicImage, GenericImageView, imageops::FilterType};
+use image::{DynamicImage, GenericImageView, ImageBuffer, imageops::FilterType};
 use serde_json::Value;
 use tauri::Manager;
 
@@ -38,8 +43,17 @@ pub async fn run_reduced_export(
     paths: Vec<String>,
     output: &str,
     max_dim: u32,
+    cache_dir: Option<&str>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    // the cache only saves time: without a usable folder every image is simply decoded
+    let cache_dir = cache_dir.filter(|dir| match std::fs::create_dir_all(dir) {
+        Ok(()) => true,
+        Err(e) => {
+            cli_eprintln!("not cached: cache directory {}: {}", dir, e);
+            false
+        }
+    });
     let state = app_handle.state::<AppState>();
     let context = get_or_init_gpu_context(&state, &app_handle)?;
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
@@ -66,7 +80,7 @@ pub async fn run_reduced_export(
     for (path, name) in paths.iter().zip(&names) {
         let started = std::time::Instant::now();
         let target = Path::new(output).join(format!("{name}.tiff"));
-        let result = render_reduced(path, max_dim, &context, &state, &app_handle, &settings)
+        let result = render_reduced(path, max_dim, cache_dir.map(Path::new), &context, &state, &app_handle, &settings)
             .and_then(|image| image.to_rgb16().save(&target).map_err(|e| e.to_string()));
         match result {
             Ok(()) => cli_println!(
@@ -87,10 +101,20 @@ pub async fn run_reduced_export(
     Ok(())
 }
 
+/// The image the GPU starts from: decoded, composited, geometry applied, reduced; with the scale
+/// and crop offset the masks need at that size.
+struct Base {
+    image: DynamicImage,
+    gpu_scale: f32,
+    crop_offset: (f32, f32),
+}
+
 /// One image from its sidecar at most `max_dim` px on the long edge, 16-bit.
+#[allow(clippy::too_many_arguments)]
 fn render_reduced(
     path: &str,
     max_dim: u32,
+    cache_dir: Option<&Path>,
     context: &GpuContext,
     state: &tauri::State<AppState>,
     app_handle: &tauri::AppHandle,
@@ -100,12 +124,6 @@ fn render_reduced(
     let source = source_path.to_string_lossy().to_string();
     let is_raw = is_raw_file(&source);
     let js_adjustments: Value = load_sidecar(&sidecar_path).adjustments;
-
-    // decoded and composited as export does it: full development keeps the highlight headroom
-    // that the fast demosaic clips at 1.0, and saved AI patches are applied at full size
-    let bytes = std::fs::read(&source).map_err(|e| format!("{}: {}", source, e))?;
-    let original = load_and_composite(&bytes, &source, &js_adjustments, false, settings, None)
-        .map_err(|e| e.to_string())?;
     let mask_definitions: Vec<MaskDefinition> = js_adjustments
         .get("masks")
         .and_then(|m| serde_json::from_value(m.clone()).ok())
@@ -113,6 +131,7 @@ fn render_reduced(
 
     // colour and luminance masks sample the full-size image: render exactly as export, then reduce
     if mask_definitions.iter().any(MaskDefinition::requires_warped_image) {
+        let original = decode(&source, &js_adjustments, settings)?;
         let full = crate::export_processing::process_image_for_export_pipeline(
             path,
             &original,
@@ -132,27 +151,21 @@ fn render_reduced(
         });
     }
 
-    let (transformed, unscaled_crop_offset) =
-        apply_all_transformations(Cow::Borrowed(&original), &js_adjustments);
-    let (w, h) = transformed.dimensions();
-    if w.max(h) > max_dim && (u64::from(w.min(h)) * u64::from(max_dim)) < u64::from(w.max(h)) {
-        return Err(format!(
-            "{}x{} is too thin to reduce to {} px",
-            w, h, max_dim
-        ));
-    }
-    let base = if w > max_dim || h > max_dim {
-        downscale_f32_image(transformed.as_ref(), max_dim, max_dim)
-    } else {
-        transformed.into_owned()
+    let cache = cache_dir.and_then(|d| Some(d.join(cache_key(&source, &js_adjustments, max_dim, settings)?)));
+    let base = match cache.as_deref().and_then(read_base) {
+        Some(base) => base,
+        None => {
+            let base = reduce(&source, &js_adjustments, max_dim, settings)?;
+            if let Some(c) = &cache
+                && let Err(e) = write_base(c, &base)
+            {
+                cli_eprintln!("{}: not cached: {}", source, e);
+            }
+            base
+        }
     };
-    let (bw, bh) = base.dimensions();
-    let gpu_scale = if w > 0 { bw as f32 / w as f32 } else { 1.0 };
-
-    let crop_offset = (
-        unscaled_crop_offset.0 * gpu_scale,
-        unscaled_crop_offset.1 * gpu_scale,
-    );
+    let (bw, bh) = base.image.dimensions();
+    let (gpu_scale, crop_offset) = (base.gpu_scale, base.crop_offset);
     let mask_bitmaps: Vec<_> = mask_definitions
         .iter()
         .filter_map(|def| {
@@ -185,7 +198,7 @@ fn render_reduced(
     process_and_get_dynamic_image_with_precision(
         context,
         state,
-        &base,
+        &base.image,
         job_hash,
         RenderRequest {
             adjustments,
@@ -196,4 +209,138 @@ fn render_reduced(
         "glidelapse_reduced_export",
         RenderOutputPrecision::SixteenBit,
     )
+}
+
+/// Decoded and composited as export does it: full development keeps the highlight headroom that
+/// the fast demosaic clips at 1.0, and saved AI patches are applied at full size.
+fn decode(source: &str, js_adjustments: &Value, settings: &AppSettings) -> Result<DynamicImage, String> {
+    let bytes = std::fs::read(source).map_err(|e| format!("{}: {}", source, e))?;
+    load_and_composite(&bytes, source, js_adjustments, false, settings, None).map_err(|e| e.to_string())
+}
+
+/// Decode, apply the geometry, reduce to at most `max_dim` before the GPU.
+fn reduce(source: &str, js_adjustments: &Value, max_dim: u32, settings: &AppSettings) -> Result<Base, String> {
+    let original = decode(source, js_adjustments, settings)?;
+    let (transformed, unscaled_crop_offset) =
+        apply_all_transformations(Cow::Borrowed(&original), js_adjustments);
+    let (w, h) = transformed.dimensions();
+    if w.max(h) > max_dim && (u64::from(w.min(h)) * u64::from(max_dim)) < u64::from(w.max(h)) {
+        return Err(format!("{}x{} is too thin to reduce to {} px", w, h, max_dim));
+    }
+    let image = if w > max_dim || h > max_dim {
+        downscale_f32_image(transformed.as_ref(), max_dim, max_dim)
+    } else {
+        transformed.into_owned()
+    };
+    let gpu_scale = if w > 0 { image.width() as f32 / w as f32 } else { 1.0 };
+    Ok(Base {
+        image,
+        gpu_scale,
+        crop_offset: (unscaled_crop_offset.0 * gpu_scale, unscaled_crop_offset.1 * gpu_scale),
+    })
+}
+
+/// Cache file name. Everything the reduced image depends on: this RapidRAW build (a hash of
+/// the executable), the source as named (its extension picks the decoder) and as stored (device,
+/// inode, size, modification and change time: the change time moves on every write, even when a
+/// tool keeps the modification time), the size, the decoding settings and environment, and every
+/// adjustment except masks, which only act on the GPU. Unix only; elsewhere nothing is cached.
+#[cfg(unix)]
+fn cache_key(source: &str, js_adjustments: &Value, max_dim: u32, settings: &AppSettings) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    static BUILD: std::sync::OnceLock<Option<blake3::Hash>> = std::sync::OnceLock::new();
+    let build = BUILD.get_or_init(|| std::fs::read(std::env::current_exe().ok()?).ok().map(|b| blake3::hash(&b)));
+    let file = std::fs::metadata(std::fs::canonicalize(source).ok()?).ok()?;
+    let mut adjustments = js_adjustments.clone();
+    adjustments.as_object_mut()?.remove("masks");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"glidelapse-base-3\0");
+    hasher.update(build.as_ref()?.as_bytes());
+    hasher.update(Path::new(source).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default().as_bytes());
+    for n in [file.dev(), file.ino(), file.size(), file.mtime() as u64, file.mtime_nsec() as u64, file.ctime() as u64, file.ctime_nsec() as u64] {
+        hasher.update(&n.to_le_bytes());
+    }
+    hasher.update(&max_dim.to_le_bytes());
+    hasher.update(serde_json::to_string(&adjustments).ok()?.as_bytes());
+    // only the settings decoding reads: the rest holds hash maps that serialise in a different
+    // order in every process
+    let decoding = (
+        settings.apply_preprocessing_to_non_raws,
+        &settings.linear_raw_mode,
+        settings.raw_highlight_compression,
+        settings.raw_preprocessing_color_nr,
+        settings.raw_preprocessing_sharpening,
+        settings.use_apple_raw9,
+    );
+    hasher.update(format!("{decoding:?}").as_bytes());
+    // the RAW decoder reads some switches from the environment
+    let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("RAWLER")).collect();
+    env.sort();
+    hasher.update(format!("{env:?}").as_bytes());
+    Some(format!("{}.rgb32f", hasher.finalize().to_hex()))
+}
+
+#[cfg(not(unix))]
+fn cache_key(_: &str, _: &Value, _: u32, _: &AppSettings) -> Option<String> {
+    None
+}
+
+const MAGIC: &[u8; 4] = b"GLB3";
+/// Magic, width, height, gpu scale, crop offset x/y, then BLAKE3 of all of those and the pixels.
+const FIELDS: usize = 4 + 4 * 5;
+const HEADER: usize = FIELDS + 32;
+
+fn checksum(fields: &[u8], payload: &[u8]) -> blake3::Hash {
+    blake3::Hasher::new().update(fields).update(payload).finalize()
+}
+
+/// Header then RGB f32 pixels, native byte order; written under a name of its own and renamed,
+/// so a reader never sees a half-written entry.
+fn write_base(path: &Path, base: &Base) -> Result<(), String> {
+    let DynamicImage::ImageRgb32F(pixels) = &base.image else {
+        return Err("not an RGB float image".into());
+    };
+    let payload: &[u8] = bytemuck::cast_slice(pixels.as_raw());
+    let mut bytes = Vec::with_capacity(HEADER + payload.len());
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&pixels.width().to_ne_bytes());
+    bytes.extend_from_slice(&pixels.height().to_ne_bytes());
+    for v in [base.gpu_scale, base.crop_offset.0, base.crop_offset.1] {
+        bytes.extend_from_slice(&v.to_ne_bytes());
+    }
+    let sum = checksum(&bytes, payload);
+    bytes.extend_from_slice(sum.as_bytes());
+    bytes.extend_from_slice(payload);
+    static WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = PathBuf::from(format!("{}.{}-{}.part", path.display(), std::process::id(), n));
+    let r = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.map_err(|e| e.to_string())
+}
+
+/// An entry only when it is complete and intact: exact length for its size, and a checksum that
+/// matches both the header fields and the pixels.
+fn read_base(path: &Path) -> Option<Base> {
+    let bytes = std::fs::read(path).ok()?;
+    let word = |i: usize| -> Option<[u8; 4]> { bytes.get(i..i + 4)?.try_into().ok() };
+    if bytes.get(..4)? != MAGIC {
+        return None;
+    }
+    let (w, h) = (u32::from_ne_bytes(word(4)?), u32::from_ne_bytes(word(8)?));
+    let f = |i: usize| Some(f32::from_ne_bytes(word(i)?));
+    let (gpu_scale, x, y) = (f(12)?, f(16)?, f(20)?);
+    let payload = bytes.get(HEADER..)?;
+    let expected = usize::try_from(u64::from(w) * u64::from(h) * 12).ok()?;
+    if w == 0 || h == 0 || payload.len() != expected || !gpu_scale.is_finite() || !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    if checksum(bytes.get(..FIELDS)?, payload).as_bytes() != bytes.get(FIELDS..HEADER)? {
+        return None;
+    }
+    let data: Vec<f32> = bytemuck::pod_collect_to_vec(payload);
+    let pixels = ImageBuffer::from_raw(w, h, data)?;
+    Some(Base { image: DynamicImage::ImageRgb32F(pixels), gpu_scale, crop_offset: (x, y) })
 }

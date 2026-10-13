@@ -1985,7 +1985,7 @@ pub async fn run_headless_export(
     }
 
     if let Some(max_dim) = session.max_size {
-        return crate::glidelapse::run_reduced_export(paths, &session.output, max_dim, app_handle.clone()).await;
+        return crate::glidelapse::run_reduced_export(paths, &session.output, max_dim, session.cache_dir.as_deref(), app_handle.clone()).await;
     }
 
     let output_path = std::path::Path::new(&session.output);
