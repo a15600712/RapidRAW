@@ -344,3 +344,128 @@ fn read_base(path: &Path) -> Option<Base> {
     let pixels = ImageBuffer::from_raw(w, h, data)?;
     Some(Base { image: DynamicImage::ImageRgb32F(pixels), gpu_scale, crop_offset: (x, y) })
 }
+
+/// The running GlideLapse action's process group, so the panel can stop it and the RapidRAW
+/// renders it started.
+static RUNNING: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+/// Run the installed `glidelapse` program (or `GLIDELAPSE_BIN`) with `args` for the Timelapse
+/// section: one action at a time, every line it reports sent as a `glidelapse-log` event, its
+/// renders done by this very RapidRAW build (`GLIDELAPSE_RAPIDRAW`). Returns the exit code.
+#[tauri::command]
+pub async fn glidelapse_run(args: Vec<String>, app_handle: tauri::AppHandle) -> Result<i32, String> {
+    use std::io::BufRead;
+    use tauri::Emitter;
+    let rapidraw = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bin = std::env::var("GLIDELAPSE_BIN").unwrap_or_else(|_| "glidelapse".to_string());
+    STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut running = RUNNING.lock().map_err(|e| e.to_string())?;
+        if running.is_some() {
+            return Err("a GlideLapse action is already running".to_string());
+        }
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.args(&args)
+            .env("GLIDELAPSE_RAPIDRAW", &rapidraw)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot start {}: {} (install GlideLapse or set GLIDELAPSE_BIN)", bin, e))?;
+        *running = Some(child.id());
+        drop(running);
+        if STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = glidelapse_cancel();
+        }
+        if let Some(err) = child.stderr.take() {
+            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = app_handle.emit("glidelapse-log", line);
+            }
+        }
+        let status = child.wait().map_err(|e| e.to_string());
+        *RUNNING.lock().map_err(|e| e.to_string())? = None;
+        Ok(status?.code().unwrap_or(-1))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// RapidRAW commands that write sidecars. While a GlideLapse action runs they are refused, so
+/// nothing RapidRAW holds in memory (the open photo, auto-sync, paste, ratings) is saved over what
+/// glidelapse writes; the Timelapse section reloads everything once the action has finished.
+const WRITERS: &[&str] = &[
+    "save_metadata_and_update_thumbnail",
+    "apply_adjustments_to_paths",
+    "reset_adjustments_for_paths",
+    "apply_auto_lens_correction_to_paths",
+    "apply_auto_adjustments_to_paths",
+    "clear_all_sidecars",
+    "set_color_label_for_paths",
+    "set_rating_for_paths",
+    "set_flag_for_paths",
+    "add_tag_for_paths",
+    "remove_tag_for_paths",
+    "clear_ai_tags",
+    "clear_all_tags",
+    "start_background_indexing",
+    "update_exif_fields",
+    "rename_files",
+    "move_files",
+    "copy_files",
+    "duplicate_file",
+    "create_virtual_copy",
+    "delete_files_from_disk",
+    "delete_files_with_associated",
+    "delete_folder",
+    "rename_folder",
+    "import_files",
+    // reading can write too: EXIF repair and XMP sync rewrite sidecars while loading them
+    "load_metadata",
+    "load_image",
+];
+// ponytail: refuses new writes only; a paste or AI indexing already running when an action starts
+// can still finish its own writes. Start actions when RapidRAW is idle.
+
+/// Stop pressed before the action's process exists: it is stopped as soon as it does.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RapidRAW's command handler, refusing the `WRITERS` while an action runs.
+pub fn guarded<R: tauri::Runtime>(
+    handler: impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    move |invoke| {
+        let running = RUNNING.lock().map(|r| r.is_some()).unwrap_or(false);
+        if running && WRITERS.contains(&invoke.message.command()) {
+            invoke
+                .resolver
+                .reject("GlideLapse is working on this folder: changes are not saved until it has finished");
+            return true;
+        }
+        handler(invoke)
+    }
+}
+
+/// Stop the running GlideLapse action with everything it started.
+#[tauri::command]
+pub fn glidelapse_cancel() -> Result<(), String> {
+    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    let Some(group) = *RUNNING.lock().map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        // "--": the negative number is the process group, not an option
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", "--", &format!("-{}", group)])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() { Ok(()) } else { Err(format!("could not stop process group {}", group)) }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = group;
+        Err("stopping is not supported on this system".to_string())
+    }
+}

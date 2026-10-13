@@ -2244,7 +2244,9 @@ pub fn run() {
             disks_cache_refreshing: AtomicBool::new(false),
             camera_session: Mutex::new(camera_tethering::CameraSession::new()),
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(glidelapse::guarded(tauri::generate_handler![
+            glidelapse::glidelapse_run,
+            glidelapse::glidelapse_cancel,
             apply_adjustments,
             generate_preview_for_path,
             generate_preset_preview,
@@ -2365,7 +2367,7 @@ pub fn run() {
             camera_tethering::tether_get_preview,
             camera_tethering::tether_autofocus,
             guided_perspective::calculate_guided_perspective,
-        ])
+        ]))
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(#[allow(unused_variables)] |app_handle, event| {

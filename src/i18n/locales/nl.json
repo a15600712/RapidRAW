@@ -307,7 +307,8 @@
         "color": "Kleur",
         "curves": "Curven",
         "details": "Details",
-        "effects": "Effecten"
+        "effects": "Effecten",
+        "timelapse": "Timelapse"
       },
       "title": "Aanpassingen",
       "tooltips": {
@@ -782,6 +783,28 @@
         "undo": "Ongedaan maken (Ctrl+Z) of geschiedenis (rechtermuisknop)"
       },
       "vc": "VK"
+    },
+    "timelapse": {
+      "addMasks": "Add masks",
+      "confirmDeflicker": "Deflicker the whole folder, measured inside the reference area? Every frame is rendered a few times; this can take several minutes.",
+      "confirmHolyGrail": "Compute the holy-grail compensation from every frame's exposure data and write it into the frames?",
+      "confirmKeyframes": "Clear every star in this folder and give {{n}} evenly spaced frames 5 stars? Edit those keyframes, then press Ramp.",
+      "confirmMasks": "Add four editable mask layers (2 gradients, 2 radial) to every frame that lacks them? They change nothing until you edit them on keyframes.",
+      "confirmRamp": "Ramp the keyframes' edits across all frames? Keyframes stay as you edited them; the other frames are overwritten (the first backup of every sidecar is kept).",
+      "deflicker": "Deflicker",
+      "editReference": "Edit reference area",
+      "exportVideo": "Export video…",
+      "failed": "Stopped with an error; see the lines above.",
+      "holyGrail": "Holy grail",
+      "jobs": "Parallel jobs",
+      "keyframes": "Keyframes",
+      "ramp": "Ramp",
+      "referenceMask": "GlideLapse Reference (deflicker area)",
+      "setKeyframes": "Set keyframes",
+      "setReference": "Set reference area",
+      "smoothing": "Smoothing",
+      "stop": "Stop",
+      "xmpSync": "Turn off XMP sync in RapidRAW's settings to use the Timelapse tools: with it, RapidRAW rewrites sidecars while it lists or opens photos."
     }
   },
   "export": {

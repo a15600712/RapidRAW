@@ -56,7 +56,7 @@ import { useExternalEditSession } from './hooks/useExternalEditSession';
 import ExternalEditBar from './components/ui/ExternalEditBar';
 import { Status } from './components/ui/ExportImportProperties';
 
-import { useEditorActions } from './hooks/useEditorActions';
+import { debouncedSave, useEditorActions } from './hooks/useEditorActions';
 import { useLibraryActions } from './hooks/useLibraryActions';
 import { useProductivityActions } from './hooks/useProductivityActions';
 
@@ -405,6 +405,17 @@ function App() {
       }
     }
   }, [currentFolderPath, handleSelectSubfolder, handleSelectAlbum]);
+
+  // GlideLapse's Timelapse section rewrote the folder's sidecars: reopen the folder as when it is
+  // first opened (fresh list and thumbnails, editor closed, so nothing stale can be saved back)
+  useEffect(() => {
+    const reopen = () => {
+      debouncedSave.cancel(); // an edit queued during the run must not be flushed over its result
+      if (currentFolderPath) handleSelectSubfolder(currentFolderPath, false, undefined, false, false, true);
+    };
+    window.addEventListener('glidelapse-refresh', reopen);
+    return () => window.removeEventListener('glidelapse-refresh', reopen);
+  }, [currentFolderPath, handleSelectSubfolder]);
 
   const {
     executeDelete,

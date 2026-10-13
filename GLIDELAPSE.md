@@ -4,7 +4,7 @@ This is RapidRAW (AGPL-3.0, by CyberTimon and contributors) with a small additio
 [GlideLapse](https://github.com/a15600712/glidelapse), a timelapse grading tool that works on
 RapidRAW sidecars. Branch `glidelapse`; everything else follows upstream.
 
-Changes (2026-10-13, on top of v1.6.5):
+Changes (2026-10-13/14, on top of v1.6.5):
 
 - `src-tauri/src/glidelapse.rs` (new): headless `export ... --max-size <px>` renders every image
   from its own sidecar at most `<px>` on the long edge, all in one process with the GPU kept warm.
@@ -18,6 +18,14 @@ Changes (2026-10-13, on top of v1.6.5):
   adjustments apart from masks (the key also covers this build and the file's identity; entries
   carry a checksum and are written atomically). GlideLapse's deflicker renders every frame
   several times with only its correction mask changed, so each RAW is decoded once.
+- Timelapse section (`src/components/adjustments/Timelapse.tsx`, new; shown after the editing
+  sections in `ControlsPanel.tsx`): set keyframes, ramp, holy grail, a deflicker reference area
+  drawn as a hidden radial mask on the photo, deflicker, editable mask layers, export video, and
+  the number of parallel jobs. Each action runs the installed `glidelapse` program through the
+  new commands `glidelapse_run` / `glidelapse_cancel` (`glidelapse.rs`). While it runs an overlay
+  blocks the window and RapidRAW's sidecar-writing commands are refused (`glidelapse::guarded`
+  wraps the command handler in `lib.rs`); afterwards `App.tsx` reopens the folder. Actions are
+  disabled while XMP sync is on. New UI texts are in all locale files (English).
 - `launch_request.rs`: parses `--max-size` and `--cache-dir`; `export_processing.rs`: hands such exports to the
   module above and lets it call the export pipeline; `lib.rs`: declares it.
 
