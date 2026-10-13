@@ -447,6 +447,21 @@ pub fn guarded<R: tauri::Runtime>(
     }
 }
 
+/// The preview video's bytes, played from a Blob URL: WebKitGTK does not play video from the asset
+/// protocol. Only this one file in the app cache folder can be read.
+#[tauri::command]
+pub fn glidelapse_preview_video(app_handle: tauri::AppHandle) -> Result<tauri::ipc::Response, String> {
+    let path = app_handle
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("glidelapse")
+        .join("preview.mp4");
+    std::fs::read(&path)
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Stop the running GlideLapse action with everything it started.
 #[tauri::command]
 pub fn glidelapse_cancel() -> Result<(), String> {

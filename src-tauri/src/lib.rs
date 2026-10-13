@@ -2247,6 +2247,7 @@ pub fn run() {
         .invoke_handler(glidelapse::guarded(tauri::generate_handler![
             glidelapse::glidelapse_run,
             glidelapse::glidelapse_cancel,
+            glidelapse::glidelapse_preview_video,
             apply_adjustments,
             generate_preview_for_path,
             generate_preset_preview,

@@ -4,7 +4,7 @@
 // (glidelapse::guarded) and an overlay blocks the window; afterwards the folder is reopened.
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { appCacheDir, join } from '@tauri-apps/api/path';
 import { ask, open } from '@tauri-apps/plugin-dialog';
@@ -210,6 +210,8 @@ const useRun = create<{
   preview: null,
 }));
 const say = (line: string) => useRun.setState((s) => ({ log: [...s.log.slice(-199), line] }));
+/** Counts started actions: a preview video still loading when another action began is outdated. */
+let actions = 0;
 listen<string>('glidelapse-log', (e) => say(e.payload));
 
 const stop = () => {
@@ -285,6 +287,9 @@ export default function TimelapsePanel() {
   const run = async (confirmText: string | null, ...steps: string[][]) => {
     if (!usable || !folder || useRun.getState().busy) return false;
     // every action changes the grade (or remakes the preview): an older video would mislead
+    const old = useRun.getState().preview?.src;
+    if (old) URL.revokeObjectURL(old);
+    actions += 1;
     useRun.setState({ busy: true, stopped: false, log: [], preview: null });
     try {
       if (confirmText && !(await ask(confirmText, { title: 'GlideLapse', kind: 'warning' }))) return false;
@@ -416,8 +421,23 @@ export default function TimelapsePanel() {
     if (!folder) return;
     const file = await join(await appCacheDir(), 'glidelapse', 'preview.mp4');
     const made = geom();
-    if (await run(null, ['preview', folder, '--out', file, '--jobs', String(jobs)])) {
-      useRun.setState({ preview: { folder, src: `${convertFileSrc(file)}?v=${Date.now()}`, geom: made } });
+    if (!(await run(null, ['preview', folder, '--out', file, '--jobs', String(jobs)]))) return;
+    const mine = actions;
+    try {
+      // a Blob URL: WebKitGTK does not play video from the asset protocol
+      const bytes = await invoke<ArrayBuffer>('glidelapse_preview_video');
+      // ponytail: diagnostics while the Linux playback problem is open (LOG F96); drop once it plays
+      const kind = `${Object.prototype.toString.call(bytes)} ${(bytes as ArrayBuffer)?.byteLength ?? (bytes as unknown as unknown[])?.length}`;
+      console.error(`[glidelapse] preview bytes: ${kind}`);
+      say(`preview bytes: ${kind}`);
+      // another action started while the bytes came over: this video no longer shows the grade
+      if (actions !== mine) return;
+      const src = URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
+      const old = useRun.getState().preview?.src;
+      if (old) URL.revokeObjectURL(old);
+      useRun.setState({ preview: { folder, src, geom: made } });
+    } catch (e) {
+      say(String(e));
     }
   };
 
@@ -439,7 +459,12 @@ export default function TimelapsePanel() {
             loop
             autoPlay
             muted
-            onError={() => say(t('editor.timelapse.previewFailed'))}
+            onError={(e) => {
+              const err = e.currentTarget.error;
+              console.error(`[glidelapse] preview video error ${err?.code}: ${err?.message}`);
+              say(`video error ${err?.code}: ${err?.message ?? ''}`);
+              say(t('editor.timelapse.previewFailed'));
+            }}
           />
         )}
         <Button disabled={!usable} onClick={showPreview}>

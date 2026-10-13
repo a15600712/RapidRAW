@@ -26,7 +26,7 @@
       "capabilities": ["default", "desktop-cloud"],
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPCACHE/thumbnails/*", "$APPCACHE/glidelapse/*"]
+        "scope": ["$APPCACHE/thumbnails/*"]
       }
     },
     "macOSPrivateApi": true
