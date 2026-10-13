@@ -8,7 +8,6 @@ import CurveGraph from '../../adjustments/Curves';
 import ColorPanel from '../../adjustments/Color';
 import DetailsPanel from '../../adjustments/Details';
 import EffectsPanel from '../../adjustments/Effects';
-import Timelapse from '../../adjustments/Timelapse';
 import CollapsibleSection from '../../ui/CollapsibleSection';
 import Waveform from '../editor/Waveform';
 import Resizer from '../../ui/Resizer';
@@ -338,20 +337,6 @@ export default function Controls() {
             >
               {t('editor.ai.noImageSelected')}
             </Text>
-          </div>
-        )}
-        {/* GlideLapse: timelapse actions for the open folder, after the editing sections */}
-        {selectedImage && (
-          <div className="shrink-0 group">
-            <CollapsibleSection
-              canToggleVisibility={false}
-              isContentVisible={true}
-              isOpen={Boolean((collapsibleSectionsState as unknown as Record<string, boolean>).timelapse)}
-              onToggle={() => handleToggleSection('timelapse')}
-              title={t('editor.adjustments.sections.timelapse')}
-            >
-              <Timelapse adjustments={adjustments} setAdjustments={setAdjustments} />
-            </CollapsibleSection>
           </div>
         )}
       </div>

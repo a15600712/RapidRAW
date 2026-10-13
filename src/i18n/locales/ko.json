@@ -313,8 +313,7 @@
         "color": "색상",
         "curves": "커브",
         "details": "디테일",
-        "effects": "효과",
-        "timelapse": "Timelapse"
+        "effects": "효과"
       },
       "title": "조정",
       "tooltips": {
@@ -802,12 +801,15 @@
       "holyGrail": "Holy grail",
       "jobs": "Parallel jobs",
       "keyframes": "Keyframes",
+      "preview": "Preview",
+      "previewFailed": "This preview cannot play here: install the GStreamer libav plugin (gstreamer1.0-libav) and restart RapidRAW.",
       "ramp": "Ramp",
       "referenceMask": "GlideLapse Reference (deflicker area)",
       "setKeyframes": "Set keyframes",
       "setReference": "Set reference area",
       "smoothing": "Smoothing",
       "stop": "Stop",
+      "title": "Timelapse",
       "xmpSync": "Turn off XMP sync in RapidRAW's settings to use the Timelapse tools: with it, RapidRAW rewrites sidecars while it lists or opens photos."
     }
   },

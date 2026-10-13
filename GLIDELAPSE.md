@@ -18,10 +18,13 @@ Changes (2026-10-13/14, on top of v1.6.5):
   adjustments apart from masks (the key also covers this build and the file's identity; entries
   carry a checksum and are written atomically). GlideLapse's deflicker renders every frame
   several times with only its correction mask changed, so each RAW is decoded once.
-- Timelapse section (`src/components/adjustments/Timelapse.tsx`, new; shown after the editing
-  sections in `ControlsPanel.tsx`): set keyframes, ramp, holy grail, a deflicker reference area
-  drawn as a hidden radial mask on the photo, deflicker, editable mask layers, export video, and
-  the number of parallel jobs. Each action runs the installed `glidelapse` program through the
+- Timelapse panel (`src/components/panel/right/TimelapsePanel.tsx`, new; a panel of its own in
+  the switcher next to Crop, Masks and Inpaint: `Panel.Timelapse` in `AppProperties.tsx`,
+  `PanelSwitcher.tsx`, `useUIStore.ts`, `App.tsx`): a 1280 px preview video of the whole graded
+  sequence played in the panel (written to RapidRAW's cache folder, `$APPCACHE/glidelapse/`,
+  which `tauri.conf.json` adds to the asset protocol scope), set keyframes, ramp, holy grail, a
+  deflicker reference area drawn as a hidden radial mask on the photo, deflicker, editable mask
+  layers, export video, and the number of parallel jobs. Each action runs the installed `glidelapse` program through the
   new commands `glidelapse_run` / `glidelapse_cancel` (`glidelapse.rs`). While it runs an overlay
   blocks the window and RapidRAW's sidecar-writing commands are refused (`glidelapse::guarded`
   wraps the command handler in `lib.rs`); afterwards `App.tsx` reopens the folder. Actions are
