@@ -791,6 +791,8 @@
     },
     "timelapse": {
       "addMasks": "Add masks",
+      "areaTooSmall": "The area covers too little of the photo to measure: make it bigger or move it further onto the photo.",
+      "cancel": "Cancel",
       "confirmDeflicker": "Deflicker the whole folder, measured inside the reference area? Every frame is rendered a few times; this can take several minutes.",
       "confirmHolyGrail": "Compute the holy-grail compensation from every frame's exposure data and write it into the frames?",
       "confirmKeyframes": "Clear every star in this folder and give {{n}} evenly spaced frames 5 stars? Edit those keyframes, then press Ramp.",
@@ -803,6 +805,9 @@
       "holyGrail": "Holy grail",
       "jobs": "Parallel jobs",
       "keyframes": "Keyframes",
+      "pickHint": "Drag the ellipse to move it and the white dot to resize it; use the slider to stop on any frame. Keep clouds, lights and anything moving out of it. Deflicker measures this spot on every frame. Esc cancels.",
+      "pickOnPreview": "Pick reference area on preview",
+      "playPause": "Play / pause",
       "preview": "Preview",
       "previewFailed": "This preview cannot play here: install the GStreamer libav plugin (gstreamer1.0-libav) and restart RapidRAW.",
       "ramp": "Ramp",
@@ -811,7 +816,8 @@
       "setReference": "Set reference area",
       "smoothing": "Smoothing",
       "stop": "Stop",
-      "title": "Timelapse"
+      "title": "Timelapse",
+      "useArea": "Use this area"
     }
   },
   "export": {

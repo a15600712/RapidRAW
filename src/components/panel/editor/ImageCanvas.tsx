@@ -3434,8 +3434,10 @@ const ImageCanvas = memo(
               }}
             >
               <Stage
-                width={stageWidth * maxSafeScale}
-                height={stageHeight * maxSafeScale}
+                // never 0x0 (no image size yet): Konva's buffer canvas for a mask ellipse then has no
+                // size, and WebKitGTK throws on drawing it, which takes the whole interface down
+                width={Math.max(1, stageWidth * maxSafeScale)}
+                height={Math.max(1, stageHeight * maxSafeScale)}
                 onMouseDown={handleStart}
                 onTouchStart={handleStart}
                 onMouseEnter={handleMouseEnter}
