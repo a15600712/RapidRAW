@@ -39,6 +39,7 @@ mod export_processing;
 mod file_management;
 mod focus_stacking;
 mod formats;
+mod glidelapse;
 mod gpu_processing;
 mod guided_perspective;
 mod hdr_deghosting;

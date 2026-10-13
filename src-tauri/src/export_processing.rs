@@ -953,7 +953,7 @@ impl Drop for ExportTaskGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_image_for_export_pipeline(
+pub(crate) fn process_image_for_export_pipeline(
     path: &str,
     base_image: &DynamicImage,
     js_adjustments: &Value,
@@ -1982,6 +1982,10 @@ pub async fn run_headless_export(
 
     if paths.is_empty() {
         return Err("No supported images found at the source path.".to_string());
+    }
+
+    if let Some(max_dim) = session.max_size {
+        return crate::glidelapse::run_reduced_export(paths, &session.output, max_dim, app_handle.clone()).await;
     }
 
     let output_path = std::path::Path::new(&session.output);

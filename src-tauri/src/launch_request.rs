@@ -22,6 +22,8 @@ pub struct HeadlessExportSession {
     pub tiff_bit_depth: TiffBitDepth,
     pub keep_metadata: bool,
     pub adjustments_override: Option<String>,
+    /// GlideLapse: render at most this many px on the long edge (`--max-size`).
+    pub max_size: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +53,7 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
         let mut tiff_bit_depth = TiffBitDepth::default();
         let mut keep_metadata = false;
         let mut adjustments_override = None;
+        let mut max_size = None;
 
         if let Some(src) = iter.next()
             && !src.starts_with('-')
@@ -101,8 +104,18 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
                         adjustments_override = Some(adj.clone());
                     }
                 }
+                "--max-size" => {
+                    let Some(px) = iter.next().and_then(|v| v.parse::<u32>().ok()).filter(|px| *px >= 16) else {
+                        return LaunchRequest::InvalidHeadless("--max-size needs a size in pixels (16 or more).".to_string());
+                    };
+                    max_size = Some(px);
+                }
                 _ => {}
             }
+        }
+
+        if max_size.is_some() && adjustments_override.is_some() {
+            return LaunchRequest::InvalidHeadless("--adjustments cannot be combined with --max-size.".to_string());
         }
 
         return LaunchRequest::HeadlessExport(HeadlessExportSession {
@@ -113,6 +126,7 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
             tiff_bit_depth,
             keep_metadata,
             adjustments_override,
+            max_size,
         });
     }
 
