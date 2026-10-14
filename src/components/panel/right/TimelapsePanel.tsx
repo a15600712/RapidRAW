@@ -13,18 +13,11 @@ import { create } from 'zustand';
 import Button from '../../ui/Button';
 import Slider from '../../ui/Slider';
 import Text from '../../ui/Text';
-import { Invokes, Panel } from '../../ui/AppProperties';
+import { Invokes } from '../../ui/AppProperties';
 import { TextVariants } from '../../../types/typography';
-import { Mask } from './Masks';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useLibraryStore } from '../../../store/useLibraryStore';
-import { useUIStore } from '../../../store/useUIStore';
-import { debouncedSave, useEditorActions } from '../../../hooks/useEditorActions';
-import { INITIAL_MASK_ADJUSTMENTS, INITIAL_MASK_CONTAINER } from '../../../utils/adjustments';
-import { createSubMask } from '../../../utils/maskUtils';
-
-/** The deflicker reference area: a radial mask glidelapse only reads. */
-const REFERENCE_ID = 'glidelapse-reference';
+import { debouncedSave } from '../../../hooks/useEditorActions';
 
 /** An ellipse as fractions of the visible photo: centre, radii of its width and height, and its
  * rotation in degrees (clockwise on screen, as RapidRAW's radial mask). */
@@ -34,8 +27,95 @@ type Area = { cx: number; cy: number; rx: number; ry: number; rot: number };
  * well above the 256 pixels a measurement needs. */
 const MIN_RADIUS = 0.03;
 
-/** The preview: its JPEG frames in RapidRAW's cache folder, one generation per Preview run. */
-type Preview = { folder: string; dir: string; count: number; gen: number; geom: string };
+/** The preview: its JPEG frames in RapidRAW's cache folder, as glidelapse describes them (count,
+ * every frame size, the frames' geometry), one generation per Preview run. */
+type Preview = { folder: string; dir: string; count: number; sizes: [number, number][]; geometry: string; gen: number };
+
+/** The sequence's reference area with the geometry of the preview it was drawn on (deflicker
+ * refuses it once the frames' crops changed); kept per folder, in memory and in this window's
+ * storage (LRT keeps its area per sequence too, F94). */
+type StoredArea = { area: Area; geometry: string };
+const AREA_KEY = 'glidelapse.referenceArea:';
+const areas = new Map<string, StoredArea>();
+const isArea = (v: unknown): v is Area => {
+  const a = v as Record<string, unknown> | null;
+  const n = (k: string) => (typeof a?.[k] === 'number' && Number.isFinite(a[k]) ? (a[k] as number) : NaN);
+  return (
+    n('cx') >= 0 &&
+    n('cx') <= 1 &&
+    n('cy') >= 0 &&
+    n('cy') <= 1 &&
+    n('rx') > 0 &&
+    n('ry') > 0 &&
+    Number.isFinite(n('rot'))
+  );
+};
+const loadArea = (folder: string): StoredArea | null => {
+  const kept = areas.get(folder);
+  if (kept) return kept;
+  try {
+    const v = JSON.parse(localStorage.getItem(AREA_KEY + folder) ?? 'null');
+    return v && isArea(v.area) && typeof v.geometry === 'string' ? { area: v.area, geometry: v.geometry } : null;
+  } catch {
+    return null;
+  }
+};
+const saveArea = (folder: string, stored: StoredArea) => {
+  areas.set(folder, stored);
+  try {
+    localStorage.setItem(AREA_KEY + folder, JSON.stringify(stored));
+  } catch {
+    // storage unavailable: the area lasts while RapidRAW runs
+  }
+};
+
+/** Pixels inside the ellipse on deflicker's measurement of a `w` x `h` frame, counted as
+ * glidelapse's area_mean does (at most 1024 px on the long side, never enlarged; pixel centres;
+ * RapidRAW's radial formula). It needs 256; 300 leaves room for the render size rounding. The
+ * count stops once it is enough. */
+const pixelsIn = (a: Area, w: number, h: number) => {
+  const scale = Math.min(1, 1024 / Math.max(w, h));
+  // rounded down: a render a pixel smaller must not empty the area (a very thin crop)
+  const [mw, mh] = [Math.max(1, Math.floor(w * scale)), Math.max(1, Math.floor(h * scale))];
+  // at least 3 measured pixels across each radius, however the render size rounds
+  if (a.rx * mw < 3 || a.ry * mh < 3) return 0;
+  const th = (a.rot * Math.PI) / 180;
+  const [ecx, ecy, erx, ery] = [a.cx * mw, a.cy * mh, a.rx * mw, a.ry * mh];
+  const [ex, ey] = [
+    Math.hypot(erx * Math.cos(th), ery * Math.sin(th)),
+    Math.hypot(erx * Math.sin(th), ery * Math.cos(th)),
+  ];
+  const on = (v: number, n: number) => Math.min(n, Math.max(0, v));
+  let pixels = 0;
+  for (let y = on(Math.floor(ecy - ey), mh); y < on(Math.ceil(ecy + ey), mh); y++) {
+    for (let x = on(Math.floor(ecx - ex), mw); x < on(Math.ceil(ecx + ex), mw); x++) {
+      const [dx, dy] = [x + 0.5 - ecx, y + 0.5 - ecy];
+      const [u, v] = [dx * Math.cos(th) + dy * Math.sin(th), -dx * Math.sin(th) + dy * Math.cos(th)];
+      if ((u / erx) ** 2 + (v / ery) ** 2 <= 1 && ++pixels >= 300) return pixels;
+    }
+  }
+  return pixels;
+};
+
+/** The reference area's outline over a preview canvas (viewBox 0..aspect x 0..1). */
+function AreaOutline({ area, aspect }: { area: Area; aspect: number }) {
+  const [cx, rx] = [area.cx * aspect, area.rx * aspect];
+  return (
+    <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox={`0 0 ${aspect} 1`}>
+      <ellipse
+        cx={cx}
+        cy={area.cy}
+        rx={rx}
+        ry={area.ry}
+        transform={`rotate(${area.rot} ${cx} ${area.cy})`}
+        fill="none"
+        stroke="white"
+        strokeWidth={1.5}
+        vectorEffect="non-scaling-stroke"
+      />
+    </svg>
+  );
+}
 
 /**
  * The preview played as a flipbook of its frames (LOG F96: WebKitGTK shows <video> scrambled or
@@ -50,6 +130,8 @@ function useFlipbook(p: Preview, active: boolean) {
   const [playing, setPlaying] = useState(true);
   // frames that load: a missing one ends the set there
   const [count, setCount] = useState(p.count);
+  // the frame on show may differ in size from the first (crops can change along a sequence)
+  const [size, setSize] = useState<[number, number]>(p.sizes[0] ?? [1, 1]);
   const pending = useRef(new Map<number, Promise<HTMLImageElement>>());
   const load = useCallback(
     (i: number) => {
@@ -83,6 +165,9 @@ function useFlipbook(p: Preview, active: boolean) {
         if (c.width !== img.naturalWidth) c.width = img.naturalWidth;
         if (c.height !== img.naturalHeight) c.height = img.naturalHeight;
         c.getContext('2d')?.drawImage(img, 0, 0);
+        setSize((s) =>
+          s[0] === img.naturalWidth && s[1] === img.naturalHeight ? s : [img.naturalWidth, img.naturalHeight],
+        );
         // every frame stays up 40 ms from when it is drawn, however long its decode took
         if (playing && active && count > 1) {
           timer = window.setTimeout(() => setFrame((f) => (f + 1) % count), 40);
@@ -99,7 +184,7 @@ function useFlipbook(p: Preview, active: boolean) {
       window.clearTimeout(timer);
     };
   }, [frame, playing, active, count, load]);
-  return { canvas, frame, setFrame, playing, setPlaying, count };
+  return { canvas, frame, setFrame, playing, setPlaying, count, size };
 }
 
 /** Play/pause, a frame slider (stops playback) and the frame number. */
@@ -127,42 +212,44 @@ function FlipbookControls({ fb, className }: { fb: ReturnType<typeof useFlipbook
   );
 }
 
-function Flipbook({ preview, active }: { preview: Preview; active: boolean }) {
+function Flipbook({ preview, active, area }: { preview: Preview; active: boolean; area: Area | null }) {
   const { t } = useTranslation();
   const fb = useFlipbook(preview, active);
   if (fb.count < 1) return <Text variant={TextVariants.small}>{t('editor.timelapse.previewFailed')}</Text>;
   return (
     <div className="flex flex-col gap-1">
-      <canvas ref={fb.canvas} className="w-full rounded-md bg-black" />
+      <div className="relative">
+        <canvas ref={fb.canvas} className="block w-full rounded-md bg-black" />
+        {area && <AreaOutline area={area} aspect={fb.size[0] / fb.size[1]} />}
+      </div>
       <FlipbookControls fb={fb} />
     </div>
   );
 }
 
 /**
- * The preview flipbook in a pop-out with the reference ellipse on top (LRTimelapse draws its area on
+ * The preview flipbook in a pop-out with the reference ellipse on top: the area is chosen while the
+ * whole sequence plays under it, not on one photo (LRTimelapse draws its area on
  * the sequence preview): drag inside to move it, the white dot to resize it in its own axes, the
  * slider to stop on any frame and look for clouds passing. Keys are swallowed while it is open
- * (Escape cancels), so the photo or its geometry underneath cannot change.
+ * (Escape cancels).
  */
 function ReferencePicker({
   preview,
-  size,
   initial,
   onSave,
   onCancel,
 }: {
   preview: Preview;
-  /** the visible photo in pixels (the crop) */
-  size: { width: number; height: number };
   initial: Area;
   onSave(a: Area): void;
   onCancel(): void;
 }) {
   const { t } = useTranslation();
-  const aspect = size.width / size.height;
   const [a, setA] = useState(initial);
   const fb = useFlipbook(preview, true);
+  // the frame on show sets the shape; the area is a fraction of each frame
+  const aspect = fb.size[0] / fb.size[1];
   const box = useRef<HTMLDivElement>(null);
   const drag = useRef<{ id: number; move: boolean; dx: number; dy: number } | null>(null);
   useEffect(() => {
@@ -188,27 +275,8 @@ function ReferencePicker({
   const end = (e: React.PointerEvent<SVGSVGElement>) => {
     if (drag.current?.id === e.pointerId) drag.current = null;
   };
-  // pixels of the photo inside the ellipse on deflicker's 1024 px measurement, counted exactly as
-  // glidelapse's area_mean does (pixel centres, RapidRAW's radial formula); it needs 256, and 300
-  // leaves room for the render size rounding by a pixel. The count stops once it is enough.
-  // deflicker renders at most 1024 px on the long side and never enlarges a smaller crop
-  const scale = Math.min(1, 1024 / Math.max(size.width, size.height));
-  const [mw, mh] = [Math.max(1, Math.round(size.width * scale)), Math.max(1, Math.round(size.height * scale))];
-  const [ecx, ecy, erx, ery] = [a.cx * mw, a.cy * mh, a.rx * mw, a.ry * mh];
-  const [ex, ey] = [
-    Math.hypot(erx * Math.cos(th), ery * Math.sin(th)),
-    Math.hypot(erx * Math.sin(th), ery * Math.cos(th)),
-  ];
-  const on = (v: number, n: number) => Math.min(n, Math.max(0, v));
-  let pixels = 0;
-  rows: for (let y = on(Math.floor(ecy - ey), mh); y < on(Math.ceil(ecy + ey), mh); y++) {
-    for (let x = on(Math.floor(ecx - ex), mw); x < on(Math.ceil(ecx + ex), mw); x++) {
-      const [dx, dy] = [x + 0.5 - ecx, y + 0.5 - ecy];
-      const [u, v] = [dx * Math.cos(th) + dy * Math.sin(th), -dx * Math.sin(th) + dy * Math.cos(th)];
-      if ((u / erx) ** 2 + (v / ery) ** 2 <= 1 && ++pixels >= 300) break rows;
-    }
-  }
-  const tooSmall = pixels < 300;
+  // big enough on every frame size of the sequence, or deflicker would refuse it
+  const tooSmall = preview.sizes.some(([w, h]) => pixelsIn(a, w, h) < 300);
   const width = { ['--ar' as string]: aspect };
 
   return createPortal(
@@ -278,7 +346,6 @@ const useRun = create<{
   busy: boolean;
   stopped: boolean;
   log: string[];
-  /** geom: the visible photo's geometry it was made with; the picker maps onto that */
   preview: Preview | null;
 }>(() => ({
   busy: false,
@@ -334,31 +401,18 @@ export function TimelapseOverlay() {
 
 export default function TimelapsePanel() {
   const { t } = useTranslation();
-  const adjustments = useEditorStore((s) => s.adjustments);
-  const { setAdjustments } = useEditorActions();
   const folder = useLibraryStore((s) => s.currentFolderPath);
   const frameCount = useLibraryStore((s) => s.imageList.length);
-  const selectedImage = useEditorStore((s) => s.selectedImage);
-  const selectedPath = selectedImage?.path;
-  const originalSize = useEditorStore((s) => s.originalSize);
-  // RapidRAW's decoded size, from where its own Masks panel takes it; 0 until the photo has loaded
-  const dims = {
-    width: selectedImage?.width || originalSize.width,
-    height: selectedImage?.height || originalSize.height,
-  };
   const { busy, log, preview } = useRun();
   const [keyframes, setKeyframes] = useState(5);
   const [smoothing, setSmoothing] = useState(0.5);
   const [jobs, setJobs] = useState(2);
 
   const usable = !!folder && !folder.startsWith('Album: ') && !busy;
-  const reference = (adjustments.masks || []).find((m) => m.id === REFERENCE_ID)?.subMasks[0];
-  // a reference drawn before the size was known is a dot at 0,0: it counts as none and is replaced
-  const hasReference = !!reference?.parameters?.radiusX;
-  // the reference being placed on the preview, for the photo it was opened on (null: closed)
-  const [picking, setPicking] = useState<{ area: Area; path: string } | null>(null);
-  // virtual copies share the photo's file; glidelapse works on files and their sidecars
-  const referenceFile = selectedPath && !selectedPath.includes('?vc=') ? selectedPath.split('/').pop() : undefined;
+  const [stored, setStored] = useState<StoredArea | null>(null);
+  useEffect(() => setStored(folder ? loadArea(folder) : null), [folder]);
+  // the area being placed on the preview (null: pop-out closed)
+  const [picking, setPicking] = useState<Area | null>(null);
 
   /** Runs the steps in order; true when all of them finished. */
   const run = async (confirmText: string | null, ...steps: string[][]) => {
@@ -398,87 +452,11 @@ export default function TimelapsePanel() {
     }
   };
 
-  // the visible photo in mask coordinates: the crop as RapidRAW renders it (rounded, clipped to
-  // the photo; glidelapse's effective_crop), or the whole photo, sides swapped by a quarter turn
-  const frame = () => {
-    const turned = (adjustments.orientationSteps ?? 0) % 2 === 1;
-    const [w, h] = turned ? [dims.height, dims.width] : [dims.width, dims.height];
-    const c = adjustments.crop;
-    const r = (v: number) => Math.max(0, Math.round(v));
-    if (c && r(c.width) > 0 && r(c.height) > 0 && r(c.x) < w && r(c.y) < h) {
-      const [x, y] = [r(c.x), r(c.y)];
-      return { x, y, width: Math.min(r(c.width), w - x), height: Math.min(r(c.height), h - y) };
-    }
-    return { x: 0, y: 0, width: w, height: h };
-  };
-  // everything that moves pixels between the video and the mask (glidelapse's GEOMETRY_KEYS)
-  const geom = () =>
-    JSON.stringify([
-      frame(),
-      adjustments.orientationSteps ?? 0,
-      adjustments.rotation ?? 0,
-      adjustments.flipHorizontal ?? false,
-      adjustments.flipVertical ?? false,
-    ]);
-
-  // the reference as a radial mask on this frame; the container stays hidden, so RapidRAW never
-  // renders it however it is edited, and deflicker measures the same spot on every frame
-  const putReference = (a: Area) => {
-    const f = frame();
-    const base = createSubMask(Mask.Radial, { width: f.width, height: f.height });
-    const shape = {
-      ...base,
-      parameters: {
-        ...base.parameters,
-        centerX: f.x + a.cx * f.width,
-        centerY: f.y + a.cy * f.height,
-        radiusX: a.rx * f.width,
-        radiusY: a.ry * f.height,
-        rotation: a.rot,
-      },
-    };
-    const container = {
-      ...INITIAL_MASK_CONTAINER,
-      id: REFERENCE_ID,
-      name: t('editor.timelapse.referenceMask'),
-      visible: false,
-      adjustments: { ...INITIAL_MASK_ADJUSTMENTS },
-      subMasks: [shape],
-    };
-    setAdjustments((prev) => ({
-      ...prev,
-      masks: [...(prev.masks || []).filter((m) => m.id !== REFERENCE_ID), container],
-    }));
-    return shape.id;
-  };
-
-  // a quarter-width circle in the middle, selected in the Masks panel to be moved (the ellipse
-  // itself is selected, not only its mask: RapidRAW shows handles on the active sub-mask)
-  const setReference = () => {
-    const f = frame();
-    const shapeId = hasReference
-      ? reference!.id
-      : putReference({ cx: 0.5, cy: 0.5, rx: 0.25, ry: (0.25 * f.width) / f.height, rot: 0 });
-    useEditorStore.getState().setEditor({ activeMaskContainerId: REFERENCE_ID, activeMaskId: shapeId });
-    useUIStore.getState().setPanel(Panel.Masks);
-  };
-
-  // the pop-out starts from the current reference or a centred circle
+  // the pop-out starts from the folder's area or a centred circle
   const pickOnPreview = () => {
-    if (!selectedPath) return;
-    const f = frame();
-    const p = reference?.parameters;
-    const area =
-      hasReference && p
-        ? {
-            cx: Math.min(1, Math.max(0, (p.centerX - f.x) / f.width)),
-            cy: Math.min(1, Math.max(0, (p.centerY - f.y) / f.height)),
-            rx: Math.max(MIN_RADIUS, p.radiusX / f.width),
-            ry: Math.max(MIN_RADIUS, p.radiusY / f.height),
-            rot: p.rotation ?? 0,
-          }
-        : { cx: 0.5, cy: 0.5, rx: 0.15, ry: (0.15 * f.width) / f.height, rot: 0 };
-    setPicking({ area, path: selectedPath });
+    if (!preview) return;
+    const [w, h] = preview.sizes[0] ?? [1, 1];
+    setPicking(stored?.area ?? { cx: 0.5, cy: 0.5, rx: 0.15, ry: (0.15 * w) / h, rot: 0 });
   };
 
   const exportVideo = async () => {
@@ -496,21 +474,19 @@ export default function TimelapsePanel() {
   const showPreview = async () => {
     if (!folder) return;
     const dir = await join(await appCacheDir(), 'glidelapse', 'preview');
-    const made = geom();
     if (!(await run(null, ['preview', folder, '--frames', dir, '--jobs', String(jobs)]))) return;
     const mine = actions;
     try {
       // as many as glidelapse published (it skips files RapidRAW lists, and the list may still load)
-      const count = await invoke<number>('glidelapse_preview_frames');
+      const info = await invoke<{ count: number; sizes: [number, number][]; geometry: string }>(
+        'glidelapse_preview_frames',
+      );
       if (actions !== mine) return;
-      useRun.setState({ preview: { folder, dir, count, gen: Date.now(), geom: made } });
+      useRun.setState({ preview: { folder, dir, ...info, gen: Date.now() } });
     } catch (e) {
       say(String(e));
     }
   };
-
-  const size = `${dims.width},${dims.height}`;
-  const f = frame();
 
   return (
     <div className="flex flex-col h-full">
@@ -518,33 +494,25 @@ export default function TimelapsePanel() {
         <Text variant={TextVariants.title}>{t('editor.timelapse.title')}</Text>
       </div>
       <div className="grow overflow-y-auto p-3 custom-scrollbar flex flex-col gap-2">
-        {preview?.folder === folder && <Flipbook preview={preview} active={!picking} />}
+        {preview?.folder === folder && <Flipbook preview={preview} active={!picking} area={stored?.area ?? null} />}
+        {preview?.folder === folder && stored && stored.geometry !== preview.geometry && (
+          <Text variant={TextVariants.small}>{t('editor.timelapse.areaOutdated')}</Text>
+        )}
         <Button disabled={!usable} onClick={showPreview}>
           {t('editor.timelapse.preview')}
         </Button>
-        <Button
-          // the preview must show this geometry: after a crop or turn, make a new Preview first
-          disabled={
-            !usable ||
-            preview?.folder !== folder ||
-            preview.geom !== geom() ||
-            !referenceFile ||
-            !dims.width ||
-            !dims.height
-          }
-          onClick={pickOnPreview}
-        >
+        <Button disabled={!usable || preview?.folder !== folder || !preview?.count} onClick={pickOnPreview}>
           {t('editor.timelapse.pickOnPreview')}
         </Button>
-        {picking && preview && (
+        {picking && preview && folder && (
           <ReferencePicker
             preview={preview}
-            size={f}
-            initial={picking.area}
+            initial={picking}
             onCancel={() => setPicking(null)}
-            onSave={(area) => {
-              // only onto the photo it was opened for (keys are blocked meanwhile, this is a guard)
-              if (useEditorStore.getState().selectedImage?.path === picking.path) putReference(area);
+            onSave={(a) => {
+              const s = { area: a, geometry: preview.geometry };
+              setStored(s);
+              saveArea(folder, s);
               setPicking(null);
             }}
           />
@@ -591,19 +559,20 @@ export default function TimelapsePanel() {
           >
             {t('editor.timelapse.holyGrail')}
           </Button>
-          <Button disabled={!usable || !referenceFile || !dims.width || !dims.height} onClick={setReference}>
-            {t(hasReference ? 'editor.timelapse.editReference' : 'editor.timelapse.setReference')}
-          </Button>
           <Button
-            disabled={!usable || !hasReference || !referenceFile || !dims.width || !dims.height}
+            disabled={!usable || !stored}
             onClick={() =>
+              stored &&
               run(t('editor.timelapse.confirmDeflicker'), [
                 'deflicker',
                 folder!,
-                '--reference',
-                referenceFile!,
-                '--size',
-                size,
+                '--ellipse',
+                [stored.area.cx, stored.area.cy, stored.area.rx, stored.area.ry, stored.area.rot]
+                  .map((v) => v.toFixed(5))
+                  .join(','),
+                // glidelapse refuses the area once the frames' crops changed since its preview
+                '--geometry',
+                stored.geometry,
                 '--passes',
                 '2',
                 '--fast',

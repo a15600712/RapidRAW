@@ -447,19 +447,22 @@ pub fn guarded<R: tauri::Runtime>(
     }
 }
 
-/// How many frames the last preview published (frame_000001.jpg on, without gaps) in RapidRAW's
-/// cache folder; only that folder is looked at.
+/// The last preview as glidelapse described it (info.json next to its frames in RapidRAW's cache
+/// folder: count, every frame size, geometry); only that folder is looked at.
 #[tauri::command]
-pub fn glidelapse_preview_frames(app_handle: tauri::AppHandle) -> Result<usize, String> {
+pub fn glidelapse_preview_frames(app_handle: tauri::AppHandle) -> Result<Value, String> {
     let dir = app_handle
         .path()
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("glidelapse")
         .join("preview");
-    Ok((1..)
-        .take_while(|i| dir.join(format!("frame_{i:06}.jpg")).is_file())
-        .count())
+    let text = std::fs::read_to_string(dir.join("info.json")).map_err(|e| format!("preview info: {e}"))?;
+    let info: Value = serde_json::from_str(&text).map_err(|e| format!("preview info: {e}"))?;
+    if !dir.join("frame_000001.jpg").is_file() {
+        return Err("preview info without frames".into());
+    }
+    Ok(info)
 }
 
 /// Stop the running GlideLapse action with everything it started.

@@ -24,9 +24,9 @@ Changes (2026-10-13/14, on top of v1.6.5):
   sequence played in the panel (written to RapidRAW's cache folder, `$APPCACHE/glidelapse/`,
   as 1280 px JPEG frames played as a flipbook, since WebKitGTK shows <video> scrambled or grey on
   some Linux GPUs; `tauri.conf.json` lets the asset protocol read only those frames), a pop-out
-  to draw the deflicker reference area on that preview, set keyframes, ramp, holy grail, a
-  deflicker reference area drawn as a hidden radial mask on the photo, deflicker, editable mask
-  layers, export video, and the number of parallel jobs. Each action runs the installed
+  to draw the deflicker reference area on that preview while the sequence plays (kept per
+  folder, passed to deflicker as an ellipse), set keyframes, ramp, holy grail, deflicker,
+  editable mask layers, export video, and the number of parallel jobs. Each action runs the installed
   `glidelapse` program through the
   new commands `glidelapse_run` / `glidelapse_cancel` (`glidelapse.rs`). While it runs an overlay
   (rendered by `App.tsx`) blocks the window and its keyboard shortcuts, and RapidRAW's
