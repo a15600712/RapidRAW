@@ -448,7 +448,8 @@ pub fn guarded<R: tauri::Runtime>(
 }
 
 /// The last preview as glidelapse described it (info.json next to its frames in RapidRAW's cache
-/// folder: count, every frame size, geometry); only that folder is looked at.
+/// folder: count, every frame size, geometry) and `made`, when that info.json was written (ms since
+/// 1970): a Preview run that was stopped can still have published; only that folder is looked at.
 #[tauri::command]
 pub fn glidelapse_preview_frames(app_handle: tauri::AppHandle) -> Result<Value, String> {
     let dir = app_handle
@@ -457,11 +458,19 @@ pub fn glidelapse_preview_frames(app_handle: tauri::AppHandle) -> Result<Value, 
         .map_err(|e| e.to_string())?
         .join("glidelapse")
         .join("preview");
-    let text = std::fs::read_to_string(dir.join("info.json")).map_err(|e| format!("preview info: {e}"))?;
-    let info: Value = serde_json::from_str(&text).map_err(|e| format!("preview info: {e}"))?;
+    let path = dir.join("info.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("preview info: {e}"))?;
+    let mut info: Value = serde_json::from_str(&text).map_err(|e| format!("preview info: {e}"))?;
     if !dir.join("frame_000001.jpg").is_file() {
         return Err("preview info without frames".into());
     }
+    let made = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("preview info: {e}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("preview info: {e}"))?
+        .as_millis() as u64;
+    info.as_object_mut().ok_or("preview info: not an object")?.insert("made".into(), made.into());
     Ok(info)
 }
 

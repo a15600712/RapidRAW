@@ -28,8 +28,17 @@ type Area = { cx: number; cy: number; rx: number; ry: number; rot: number };
 const MIN_RADIUS = 0.03;
 
 /** The preview: its JPEG frames in RapidRAW's cache folder, as glidelapse describes them (count,
- * every frame size, the frames' geometry), one generation per Preview run. */
-type Preview = { folder: string; dir: string; count: number; sizes: [number, number][]; geometry: string; gen: number };
+ * every frame size, the frames' geometry), one generation per Preview run; it stays until the
+ * next Preview replaces it, marked outdated once an action changed the grade. */
+type Preview = {
+  folder: string;
+  dir: string;
+  count: number;
+  sizes: [number, number][];
+  geometry: string;
+  gen: number;
+  outdated?: boolean;
+};
 
 /** The sequence's reference area with the geometry of the preview it was drawn on (deflicker
  * refuses it once the frames' crops changed); kept per folder, in memory and in this window's
@@ -354,8 +363,6 @@ const useRun = create<{
   preview: null,
 }));
 const say = (line: string) => useRun.setState((s) => ({ log: [...s.log.slice(-199), line] }));
-/** Counts started actions: a preview still being looked up when another action began is outdated. */
-let actions = 0;
 listen<string>('glidelapse-log', (e) => say(e.payload));
 
 const stop = () => {
@@ -414,35 +421,43 @@ export default function TimelapsePanel() {
   // the area being placed on the preview (null: pop-out closed)
   const [picking, setPicking] = useState<Area | null>(null);
 
-  /** Runs the steps in order; true when all of them finished. */
-  const run = async (confirmText: string | null, ...steps: string[][]) => {
+  /** Runs the steps in order, then `after` while still busy (no other action can start before it
+   * is done); true when all steps finished. */
+  const run = async (confirmText: string | null, steps: string[][], after?: (ok: boolean) => Promise<void>) => {
     if (!usable || !folder || useRun.getState().busy) return false;
-    // every action changes the grade (or remakes the preview): an older preview would mislead
-    actions += 1;
-    useRun.setState({ busy: true, stopped: false, log: [], preview: null });
+    useRun.setState({ busy: true, stopped: false, log: [] });
     try {
       if (confirmText && !(await ask(confirmText, { title: 'GlideLapse', kind: 'warning' }))) return false;
-      // the open photo's latest edits must be on disk before glidelapse reads the sidecars
+      // the open photo's latest edits must be on disk before glidelapse reads the sidecars; when
+      // that fails nothing runs and nothing reloads (the outer catch)
       const { selectedImage, adjustments: current } = useEditorStore.getState();
       debouncedSave.cancel();
       if (selectedImage?.isReady) {
         await invoke(Invokes.SaveMetadataAndUpdateThumbnail, { path: selectedImage.path, adjustments: current });
       }
+      // the action changes the grade (or remakes the preview): the shown preview is from before it
+      useRun.setState((s) => ({ preview: s.preview && { ...s.preview, outdated: true } }));
       let ok = true;
-      for (const args of steps) {
-        if (useRun.getState().stopped) {
-          ok = false;
-          break;
+      try {
+        for (const args of steps) {
+          if (useRun.getState().stopped) {
+            ok = false;
+            break;
+          }
+          say(`$ glidelapse ${args.join(' ')}`);
+          if ((await invoke<number>('glidelapse_run', { args })) !== 0) {
+            say(t('editor.timelapse.failed'));
+            ok = false;
+            break;
+          }
         }
-        say(`$ glidelapse ${args.join(' ')}`);
-        if ((await invoke<number>('glidelapse_run', { args })) !== 0) {
-          say(t('editor.timelapse.failed'));
-          ok = false;
-          break;
-        }
+      } catch (e) {
+        say(String(e));
+        ok = false;
       }
       // glidelapse rewrote the sidecars: App.tsx reopens the folder
       window.dispatchEvent(new Event('glidelapse-refresh'));
+      await after?.(ok);
       return ok;
     } catch (e) {
       say(String(e));
@@ -462,11 +477,10 @@ export default function TimelapsePanel() {
   const exportVideo = async () => {
     const out = await open({ directory: true, title: t('editor.timelapse.exportVideo') });
     if (typeof out !== 'string' || !folder) return;
-    run(
-      null,
+    run(null, [
       ['export', folder, '--out', out, '--jobs', String(jobs)],
       ['video', out, '--out', `${out}/glidelapse.mp4`],
-    );
+    ]);
   };
 
   // every frame as graded now, 1280 px JPEGs in RapidRAW's cache folder (asset scope), played as a
@@ -474,18 +488,20 @@ export default function TimelapsePanel() {
   const showPreview = async () => {
     if (!folder) return;
     const dir = await join(await appCacheDir(), 'glidelapse', 'preview');
-    if (!(await run(null, ['preview', folder, '--frames', dir, '--jobs', String(jobs)]))) return;
-    const mine = actions;
-    try {
-      // as many as glidelapse published (it skips files RapidRAW lists, and the list may still load)
-      const info = await invoke<{ count: number; sizes: [number, number][]; geometry: string }>(
-        'glidelapse_preview_frames',
-      );
-      if (actions !== mine) return;
-      useRun.setState({ preview: { folder, dir, ...info, gen: Date.now() } });
-    } catch (e) {
-      say(String(e));
-    }
+    const started = Date.now();
+    await run(null, [['preview', folder, '--frames', dir, '--jobs', String(jobs)]], async (ok) => {
+      // glidelapse swaps the new frames in at its very end, so even a stopped run may have replaced
+      // them: show what the folder holds whenever this run wrote it, else keep the old preview
+      try {
+        const info = await invoke<{ count: number; sizes: [number, number][]; geometry: string; made: number }>(
+          'glidelapse_preview_frames',
+        );
+        if (ok || info.made >= started) useRun.setState({ preview: { folder, dir, ...info, gen: Date.now() } });
+      } catch (e) {
+        say(String(e));
+        useRun.setState({ preview: null });
+      }
+    });
   };
 
   return (
@@ -495,14 +511,14 @@ export default function TimelapsePanel() {
       </div>
       <div className="grow overflow-y-auto p-3 custom-scrollbar flex flex-col gap-2">
         {preview?.folder === folder && <Flipbook preview={preview} active={!picking} area={stored?.area ?? null} />}
+        {preview?.folder === folder && preview.outdated && (
+          <Text variant={TextVariants.small}>{t('editor.timelapse.previewOutdated')}</Text>
+        )}
         {preview?.folder === folder && stored && stored.geometry !== preview.geometry && (
           <Text variant={TextVariants.small}>{t('editor.timelapse.areaOutdated')}</Text>
         )}
         <Button disabled={!usable} onClick={showPreview}>
           {t('editor.timelapse.preview')}
-        </Button>
-        <Button disabled={!usable || preview?.folder !== folder || !preview?.count} onClick={pickOnPreview}>
-          {t('editor.timelapse.pickOnPreview')}
         </Button>
         {picking && preview && folder && (
           <ReferencePicker
@@ -529,15 +545,22 @@ export default function TimelapsePanel() {
           disabled={!usable}
           onClick={() =>
             run(t('editor.timelapse.confirmKeyframes', { n: keyframes }), [
-              'keyframes',
-              folder!,
-              '--count',
-              String(keyframes),
+              ['keyframes', folder!, '--count', String(keyframes)],
             ])
           }
         >
-          {t('editor.timelapse.setKeyframes')}
+          1. {t('editor.timelapse.setKeyframes')}
         </Button>
+        <Button
+          disabled={!usable}
+          onClick={() => run(t('editor.timelapse.confirmHolyGrail'), [['holygrail', folder!]])}
+        >
+          2. {t('editor.timelapse.holyGrail')}
+        </Button>
+        <Button disabled={!usable} onClick={() => run(t('editor.timelapse.confirmMasks'), [['masks', folder!]])}>
+          3. {t('editor.timelapse.addMasks')}
+        </Button>
+        <Text variant={TextVariants.small}>4. {t('editor.timelapse.editKeyframes')}</Text>
         <Slider
           label={t('editor.timelapse.smoothing')}
           min={0}
@@ -546,24 +569,21 @@ export default function TimelapsePanel() {
           value={smoothing}
           onChange={(e) => setSmoothing(Number(e.target.value))}
         />
-        <div className="grid grid-cols-2 gap-2">
-          <Button
-            disabled={!usable}
-            onClick={() => run(t('editor.timelapse.confirmRamp'), ['ramp', folder!, '--smoothing', String(smoothing)])}
-          >
-            {t('editor.timelapse.ramp')}
-          </Button>
-          <Button
-            disabled={!usable}
-            onClick={() => run(t('editor.timelapse.confirmHolyGrail'), ['holygrail', folder!])}
-          >
-            {t('editor.timelapse.holyGrail')}
-          </Button>
-          <Button
-            disabled={!usable || !stored}
-            onClick={() =>
-              stored &&
-              run(t('editor.timelapse.confirmDeflicker'), [
+        <Button
+          disabled={!usable}
+          onClick={() => run(t('editor.timelapse.confirmRamp'), [['ramp', folder!, '--smoothing', String(smoothing)]])}
+        >
+          5. {t('editor.timelapse.ramp')}
+        </Button>
+        <Button disabled={!usable || preview?.folder !== folder || !preview?.count} onClick={pickOnPreview}>
+          6. {t('editor.timelapse.pickOnPreview')}
+        </Button>
+        <Button
+          disabled={!usable || !stored}
+          onClick={() =>
+            stored &&
+            run(t('editor.timelapse.confirmDeflicker'), [
+              [
                 'deflicker',
                 folder!,
                 '--ellipse',
@@ -578,18 +598,15 @@ export default function TimelapsePanel() {
                 '--fast',
                 '--jobs',
                 String(jobs),
-              ])
-            }
-          >
-            {t('editor.timelapse.deflicker')}
-          </Button>
-          <Button disabled={!usable} onClick={() => run(t('editor.timelapse.confirmMasks'), ['masks', folder!])}>
-            {t('editor.timelapse.addMasks')}
-          </Button>
-          <Button disabled={!usable} onClick={exportVideo}>
-            {t('editor.timelapse.exportVideo')}
-          </Button>
-        </div>
+              ],
+            ])
+          }
+        >
+          7. {t('editor.timelapse.deflicker')}
+        </Button>
+        <Button disabled={!usable} onClick={exportVideo}>
+          8. {t('editor.timelapse.exportVideo')}
+        </Button>
         <Slider
           label={t('editor.timelapse.jobs')}
           min={1}

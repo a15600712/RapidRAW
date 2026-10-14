@@ -812,6 +812,8 @@
     },
     "timelapse": {
       "addMasks": "Add masks",
+      "editKeyframes": "Edit the keyframes (5 stars) in RapidRAW, then:",
+      "previewOutdated": "This preview was made before the last change; press Preview to update it.",
       "areaOutdated": "The reference area was drawn on a preview with other crops: open Pick reference area on preview and check it again (Deflicker refuses it until then).",
       "areaTooSmall": "The area covers too little of the photo to measure: make it bigger or move it further onto the photo.",
       "cancel": "Cancel",
