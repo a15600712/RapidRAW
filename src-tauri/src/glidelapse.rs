@@ -31,11 +31,11 @@ use crate::image_loader::load_and_composite;
 use crate::image_processing::{
     GpuContext, RenderOutputPrecision, RenderRequest, downscale_f32_image,
     get_all_adjustments_from_json, get_or_init_gpu_context,
-    process_and_get_dynamic_image_with_precision, resolve_tonemapper_override_from_handle,
+    process_and_get_dynamic_image_with_precision, resolve_render_options,
 };
 use crate::lut_processing::get_or_load_lut;
 use crate::mask_generation::MaskDefinition;
-use crate::white_balance::as_shot_white_balance;
+use crate::as_shot::as_shot;
 use crate::{apply_all_transformations, get_cached_or_generate_mask, load_settings};
 
 /// Render `paths` at most `max_dim` px into `output`; one failed image does not stop the rest.
@@ -182,12 +182,13 @@ fn render_reduced(
         })
         .collect();
 
-    let tone_mapper = resolve_tonemapper_override_from_handle(app_handle, is_raw);
+    // as export: the as-shot white balance and baseline exposure, the tone mapper and baseline
+    // settings
     let mut adjustments = get_all_adjustments_from_json(
         &js_adjustments,
         is_raw,
-        as_shot_white_balance(&source),
-        tone_mapper,
+        as_shot(&source),
+        resolve_render_options(settings, is_raw),
     );
     adjustments.global.show_clipping = 0;
     let lut = js_adjustments["lutPath"]
