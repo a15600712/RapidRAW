@@ -447,19 +447,19 @@ pub fn guarded<R: tauri::Runtime>(
     }
 }
 
-/// The preview video's bytes, played from a Blob URL: WebKitGTK does not play video from the asset
-/// protocol. Only this one file in the app cache folder can be read.
+/// How many frames the last preview published (frame_000001.jpg on, without gaps) in RapidRAW's
+/// cache folder; only that folder is looked at.
 #[tauri::command]
-pub fn glidelapse_preview_video(app_handle: tauri::AppHandle) -> Result<tauri::ipc::Response, String> {
-    let path = app_handle
+pub fn glidelapse_preview_frames(app_handle: tauri::AppHandle) -> Result<usize, String> {
+    let dir = app_handle
         .path()
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("glidelapse")
-        .join("preview.mp4");
-    std::fs::read(&path)
-        .map(tauri::ipc::Response::new)
-        .map_err(|e| format!("{}: {e}", path.display()))
+        .join("preview");
+    Ok((1..)
+        .take_while(|i| dir.join(format!("frame_{i:06}.jpg")).is_file())
+        .count())
 }
 
 /// Stop the running GlideLapse action with everything it started.

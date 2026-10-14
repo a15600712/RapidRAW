@@ -2,9 +2,9 @@
 // Every action runs the installed `glidelapse` program on the open folder through the
 // `glidelapse_run` command. While it runs, RapidRAW's sidecar writes are refused
 // (glidelapse::guarded) and an overlay blocks the window; afterwards the folder is reopened.
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { appCacheDir, join } from '@tauri-apps/api/path';
 import { ask, open } from '@tauri-apps/plugin-dialog';
@@ -34,20 +34,125 @@ type Area = { cx: number; cy: number; rx: number; ry: number; rot: number };
  * well above the 256 pixels a measurement needs. */
 const MIN_RADIUS = 0.03;
 
+/** The preview: its JPEG frames in RapidRAW's cache folder, one generation per Preview run. */
+type Preview = { folder: string; dir: string; count: number; gen: number; geom: string };
+
 /**
- * The preview video in a pop-out with the reference ellipse on top (LRTimelapse draws its area on
+ * The preview played as a flipbook of its frames (LOG F96: WebKitGTK shows <video> scrambled or
+ * grey on some Linux GPUs, while images it shows everywhere). A frame is decoded before it
+ * replaces the last one on the canvas, so nothing flashes; each stays up 40 ms (25 a second at
+ * most), and a slow decode makes playback wait, never skip, so flicker stays visible. Four frames
+ * are decoded ahead.
+ */
+function useFlipbook(p: Preview, active: boolean) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const [frame, setFrame] = useState(0);
+  const [playing, setPlaying] = useState(true);
+  // frames that load: a missing one ends the set there
+  const [count, setCount] = useState(p.count);
+  const pending = useRef(new Map<number, Promise<HTMLImageElement>>());
+  const load = useCallback(
+    (i: number) => {
+      let img = pending.current.get(i);
+      if (!img) {
+        const el = new Image();
+        el.src = `${convertFileSrc(`${p.dir}/frame_${String(i + 1).padStart(6, '0')}.jpg`)}?v=${p.gen}`;
+        img = el.decode().then(() => el);
+        pending.current.set(i, img);
+      }
+      return img;
+    },
+    [p.dir, p.gen],
+  );
+  // a new preview starts at its first frame
+  useEffect(() => {
+    pending.current.clear();
+    setFrame(0);
+    setCount(p.count);
+  }, [p.gen, p.count]);
+  useEffect(() => {
+    if (count < 1) return;
+    let live = true;
+    let timer = 0;
+    for (const k of pending.current.keys()) if ((k - frame + count) % count > 4) pending.current.delete(k);
+    for (let k = 1; k <= 4 && k < count; k++) load((frame + k) % count).catch(() => {});
+    load(frame).then(
+      (img) => {
+        const c = canvas.current;
+        if (!live || !c) return;
+        if (c.width !== img.naturalWidth) c.width = img.naturalWidth;
+        if (c.height !== img.naturalHeight) c.height = img.naturalHeight;
+        c.getContext('2d')?.drawImage(img, 0, 0);
+        // every frame stays up 40 ms from when it is drawn, however long its decode took
+        if (playing && active && count > 1) {
+          timer = window.setTimeout(() => setFrame((f) => (f + 1) % count), 40);
+        }
+      },
+      () => {
+        if (!live) return;
+        setCount(frame);
+        setFrame(0);
+      },
+    );
+    return () => {
+      live = false;
+      window.clearTimeout(timer);
+    };
+  }, [frame, playing, active, count, load]);
+  return { canvas, frame, setFrame, playing, setPlaying, count };
+}
+
+/** Play/pause, a frame slider (stops playback) and the frame number. */
+function FlipbookControls({ fb, className }: { fb: ReturnType<typeof useFlipbook>; className?: string }) {
+  const { t } = useTranslation();
+  return (
+    <div className={`flex items-center gap-2 ${className ?? ''}`}>
+      <Button onClick={() => fb.setPlaying(!fb.playing)}>{t('editor.timelapse.playPause')}</Button>
+      <input
+        type="range"
+        className="grow"
+        min={0}
+        max={Math.max(0, fb.count - 1)}
+        step={1}
+        value={fb.frame}
+        onChange={(e) => {
+          fb.setPlaying(false);
+          fb.setFrame(Number(e.target.value));
+        }}
+      />
+      <Text variant={TextVariants.small}>
+        {fb.frame + 1}/{fb.count}
+      </Text>
+    </div>
+  );
+}
+
+function Flipbook({ preview, active }: { preview: Preview; active: boolean }) {
+  const { t } = useTranslation();
+  const fb = useFlipbook(preview, active);
+  if (fb.count < 1) return <Text variant={TextVariants.small}>{t('editor.timelapse.previewFailed')}</Text>;
+  return (
+    <div className="flex flex-col gap-1">
+      <canvas ref={fb.canvas} className="w-full rounded-md bg-black" />
+      <FlipbookControls fb={fb} />
+    </div>
+  );
+}
+
+/**
+ * The preview flipbook in a pop-out with the reference ellipse on top (LRTimelapse draws its area on
  * the sequence preview): drag inside to move it, the white dot to resize it in its own axes, the
  * slider to stop on any frame and look for clouds passing. Keys are swallowed while it is open
  * (Escape cancels), so the photo or its geometry underneath cannot change.
  */
 function ReferencePicker({
-  src,
+  preview,
   size,
   initial,
   onSave,
   onCancel,
 }: {
-  src: string;
+  preview: Preview;
   /** the visible photo in pixels (the crop) */
   size: { width: number; height: number };
   initial: Area;
@@ -57,8 +162,7 @@ function ReferencePicker({
   const { t } = useTranslation();
   const aspect = size.width / size.height;
   const [a, setA] = useState(initial);
-  const [time, setTime] = useState(0);
-  const video = useRef<HTMLVideoElement>(null);
+  const fb = useFlipbook(preview, true);
   const box = useRef<HTMLDivElement>(null);
   const drag = useRef<{ id: number; move: boolean; dx: number; dy: number } | null>(null);
   useEffect(() => {
@@ -110,16 +214,7 @@ function ReferencePicker({
   return createPortal(
     <div ref={box} className="fixed inset-0 z-[900] bg-black/80 flex flex-col items-center justify-center gap-3 p-6">
       <div className="relative w-[min(90vw,calc(70vh*var(--ar)))]" style={width}>
-        <video
-          ref={video}
-          src={src}
-          className="block w-full"
-          style={{ aspectRatio: aspect }}
-          autoPlay
-          loop
-          muted
-          onTimeUpdate={(e) => setTime(e.currentTarget.currentTime / (e.currentTarget.duration || 1))}
-        />
+        <canvas ref={fb.canvas} className="block w-full" style={{ aspectRatio: aspect }} />
         <svg
           className="absolute inset-0 w-full h-full touch-none"
           viewBox={`0 0 ${aspect} 1`}
@@ -163,29 +258,11 @@ function ReferencePicker({
           <circle cx={dot[0]} cy={dot[1]} r={0.015} fill="white" />
         </svg>
       </div>
-      <input
-        type="range"
-        min={0}
-        max={1}
-        step={0.001}
-        value={time}
-        className="w-[min(90vw,calc(70vh*var(--ar)))]"
-        style={width}
-        onChange={(e) => {
-          const v = video.current;
-          if (!v) return;
-          v.pause();
-          v.currentTime = Number(e.target.value) * (v.duration || 0);
-          setTime(Number(e.target.value));
-        }}
-      />
+      <FlipbookControls fb={fb} className="w-[min(90vw,calc(70vh*var(--ar)))]" />
       <Text variant={TextVariants.small}>
         {t(tooSmall ? 'editor.timelapse.areaTooSmall' : 'editor.timelapse.pickHint')}
       </Text>
       <div className="flex gap-2">
-        <Button onClick={() => (video.current?.paused ? video.current.play() : video.current?.pause())}>
-          {t('editor.timelapse.playPause')}
-        </Button>
         <Button autoFocus disabled={tooSmall} onClick={() => onSave(a)}>
           {t('editor.timelapse.useArea')}
         </Button>
@@ -202,7 +279,7 @@ const useRun = create<{
   stopped: boolean;
   log: string[];
   /** geom: the visible photo's geometry it was made with; the picker maps onto that */
-  preview: { folder: string; src: string; geom: string } | null;
+  preview: Preview | null;
 }>(() => ({
   busy: false,
   stopped: false,
@@ -210,7 +287,7 @@ const useRun = create<{
   preview: null,
 }));
 const say = (line: string) => useRun.setState((s) => ({ log: [...s.log.slice(-199), line] }));
-/** Counts started actions: a preview video still loading when another action began is outdated. */
+/** Counts started actions: a preview still being looked up when another action began is outdated. */
 let actions = 0;
 listen<string>('glidelapse-log', (e) => say(e.payload));
 
@@ -286,9 +363,7 @@ export default function TimelapsePanel() {
   /** Runs the steps in order; true when all of them finished. */
   const run = async (confirmText: string | null, ...steps: string[][]) => {
     if (!usable || !folder || useRun.getState().busy) return false;
-    // every action changes the grade (or remakes the preview): an older video would mislead
-    const old = useRun.getState().preview?.src;
-    if (old) URL.revokeObjectURL(old);
+    // every action changes the grade (or remakes the preview): an older preview would mislead
     actions += 1;
     useRun.setState({ busy: true, stopped: false, log: [], preview: null });
     try {
@@ -416,26 +491,19 @@ export default function TimelapsePanel() {
     );
   };
 
-  // a 1280 px video of every frame as graded now, in RapidRAW's cache folder (asset scope)
+  // every frame as graded now, 1280 px JPEGs in RapidRAW's cache folder (asset scope), played as a
+  // flipbook; a new generation number makes the image URLs new
   const showPreview = async () => {
     if (!folder) return;
-    const file = await join(await appCacheDir(), 'glidelapse', 'preview.mp4');
+    const dir = await join(await appCacheDir(), 'glidelapse', 'preview');
     const made = geom();
-    if (!(await run(null, ['preview', folder, '--out', file, '--jobs', String(jobs)]))) return;
+    if (!(await run(null, ['preview', folder, '--frames', dir, '--jobs', String(jobs)]))) return;
     const mine = actions;
     try {
-      // a Blob URL: WebKitGTK does not play video from the asset protocol
-      const bytes = await invoke<ArrayBuffer>('glidelapse_preview_video');
-      // ponytail: diagnostics while the Linux playback problem is open (LOG F96); drop once it plays
-      const kind = `${Object.prototype.toString.call(bytes)} ${(bytes as ArrayBuffer)?.byteLength ?? (bytes as unknown as unknown[])?.length}`;
-      console.error(`[glidelapse] preview bytes: ${kind}`);
-      say(`preview bytes: ${kind}`);
-      // another action started while the bytes came over: this video no longer shows the grade
+      // as many as glidelapse published (it skips files RapidRAW lists, and the list may still load)
+      const count = await invoke<number>('glidelapse_preview_frames');
       if (actions !== mine) return;
-      const src = URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
-      const old = useRun.getState().preview?.src;
-      if (old) URL.revokeObjectURL(old);
-      useRun.setState({ preview: { folder, src, geom: made } });
+      useRun.setState({ preview: { folder, dir, count, gen: Date.now(), geom: made } });
     } catch (e) {
       say(String(e));
     }
@@ -450,28 +518,12 @@ export default function TimelapsePanel() {
         <Text variant={TextVariants.title}>{t('editor.timelapse.title')}</Text>
       </div>
       <div className="grow overflow-y-auto p-3 custom-scrollbar flex flex-col gap-2">
-        {preview?.folder === folder && (
-          <video
-            key={preview.src}
-            src={preview.src}
-            className="w-full rounded-md bg-black"
-            controls
-            loop
-            autoPlay
-            muted
-            onError={(e) => {
-              const err = e.currentTarget.error;
-              console.error(`[glidelapse] preview video error ${err?.code}: ${err?.message}`);
-              say(`video error ${err?.code}: ${err?.message ?? ''}`);
-              say(t('editor.timelapse.previewFailed'));
-            }}
-          />
-        )}
+        {preview?.folder === folder && <Flipbook preview={preview} active={!picking} />}
         <Button disabled={!usable} onClick={showPreview}>
           {t('editor.timelapse.preview')}
         </Button>
         <Button
-          // the video must show this geometry: after a crop or turn, make a new Preview first
+          // the preview must show this geometry: after a crop or turn, make a new Preview first
           disabled={
             !usable ||
             preview?.folder !== folder ||
@@ -486,7 +538,7 @@ export default function TimelapsePanel() {
         </Button>
         {picking && preview && (
           <ReferencePicker
-            src={preview.src}
+            preview={preview}
             size={f}
             initial={picking.area}
             onCancel={() => setPicking(null)}

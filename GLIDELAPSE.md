@@ -22,9 +22,9 @@ Changes (2026-10-13/14, on top of v1.6.5):
   the switcher next to Crop, Masks and Inpaint: `Panel.Timelapse` in `AppProperties.tsx`,
   `PanelSwitcher.tsx`, `useUIStore.ts`, `App.tsx`): a 1280 px preview video of the whole graded
   sequence played in the panel (written to RapidRAW's cache folder, `$APPCACHE/glidelapse/`,
-  and handed over by the `glidelapse_preview_video` command as a Blob URL, since WebKitGTK does not
-  play video from the asset protocol), a pop-out to draw the deflicker reference area on that
-  video, set keyframes, ramp, holy grail, a
+  as 1280 px JPEG frames played as a flipbook, since WebKitGTK shows <video> scrambled or grey on
+  some Linux GPUs; `tauri.conf.json` lets the asset protocol read only those frames), a pop-out
+  to draw the deflicker reference area on that preview, set keyframes, ramp, holy grail, a
   deflicker reference area drawn as a hidden radial mask on the photo, deflicker, editable mask
   layers, export video, and the number of parallel jobs. Each action runs the installed
   `glidelapse` program through the
