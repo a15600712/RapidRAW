@@ -448,31 +448,70 @@ pub fn guarded<R: tauri::Runtime>(
     }
 }
 
+/// The folder glidelapse publishes the panel's preview in (RapidRAW's cache folder).
+fn preview_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_handle.path().app_cache_dir().map_err(|e| e.to_string())?.join("glidelapse").join("preview"))
+}
+
+/// When a preview's info.json was written, in ms since 1970: it names that preview.
+fn made(info: &Path) -> Result<u64, String> {
+    let t = std::fs::metadata(info).and_then(|m| m.modified()).map_err(|e| format!("preview info: {e}"))?;
+    Ok(t.duration_since(std::time::UNIX_EPOCH).map_err(|e| format!("preview info: {e}"))?.as_millis() as u64)
+}
+
 /// The last preview as glidelapse described it (info.json next to its frames in RapidRAW's cache
-/// folder: count, every frame size, geometry) and `made`, when that info.json was written (ms since
-/// 1970): a Preview run that was stopped can still have published; only that folder is looked at.
+/// folder: count, every frame size, geometry, file names, brightness grid size) and `made`, when
+/// that info.json was written: a Preview run that was stopped can still have published; only that
+/// folder is looked at.
 #[tauri::command]
 pub fn glidelapse_preview_frames(app_handle: tauri::AppHandle) -> Result<Value, String> {
-    let dir = app_handle
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("glidelapse")
-        .join("preview");
+    let dir = preview_dir(&app_handle)?;
     let path = dir.join("info.json");
     let text = std::fs::read_to_string(&path).map_err(|e| format!("preview info: {e}"))?;
     let mut info: Value = serde_json::from_str(&text).map_err(|e| format!("preview info: {e}"))?;
     if !dir.join("frame_000001.jpg").is_file() {
         return Err("preview info without frames".into());
     }
-    let made = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map_err(|e| format!("preview info: {e}"))?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("preview info: {e}"))?
-        .as_millis() as u64;
+    let made = made(&path)?;
     info.as_object_mut().ok_or("preview info: not an object")?.insert("made".into(), made.into());
     Ok(info)
+}
+
+/// The brightness grid published with the preview `made` names (`grid.u16`: per frame, row after
+/// row, the mean Y' of each cell as 16-bit little-endian); refused when another preview replaced
+/// it before or while it was read.
+#[tauri::command]
+pub fn glidelapse_preview_grid(made: u64, app_handle: tauri::AppHandle) -> Result<tauri::ipc::Response, String> {
+    let dir = preview_dir(&app_handle)?;
+    let same = || self::made(&dir.join("info.json")).map(|m| m == made);
+    if !same()? {
+        return Err("the preview changed while its curves were loading".into());
+    }
+    let bytes = std::fs::read(dir.join("grid.u16")).map_err(|e| format!("preview grid: {e}"))?;
+    if !same()? {
+        return Err("the preview changed while its curves were loading".into());
+    }
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// What the panel draws over its preview for `folder`: `glidelapse curves`, which only reads the
+/// sidecars (per file: the slider values that change, HG and deflicker EV, stars).
+#[tauri::command]
+pub async fn glidelapse_curves(folder: String) -> Result<Value, String> {
+    let bin = std::env::var("GLIDELAPSE_BIN").unwrap_or_else(|_| "glidelapse".to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = std::process::Command::new(&bin)
+            .args(["curves", &folder])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot start {}: {}", bin, e))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("glidelapse curves: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Stop the running GlideLapse action with everything it started.

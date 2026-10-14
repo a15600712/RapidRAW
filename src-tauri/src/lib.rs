@@ -2321,6 +2321,8 @@ pub fn run() {
             glidelapse::glidelapse_run,
             glidelapse::glidelapse_cancel,
             glidelapse::glidelapse_preview_frames,
+            glidelapse::glidelapse_preview_grid,
+            glidelapse::glidelapse_curves,
             apply_adjustments,
             generate_preview_for_path,
             generate_preset_preview,
