@@ -2,7 +2,7 @@
 // Every action runs the installed `glidelapse` program on the open folder through the
 // `glidelapse_run` command. While it runs, RapidRAW's sidecar writes are refused
 // (glidelapse::guarded) and an overlay blocks the window; afterwards the folder is reopened.
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -57,6 +57,7 @@ type Anchor = { frame: number; area: Area };
 type StoredArea = { anchors: Anchor[]; geometry: string };
 const AREA_KEY = 'glidelapse.referenceArea:';
 const areas = new Map<string, StoredArea>();
+const NO_ANCHORS: Anchor[] = [];
 const isArea = (v: unknown): v is Area => {
   const a = v as Record<string, unknown> | null;
   const n = (k: string) => (typeof a?.[k] === 'number' && Number.isFinite(a[k]) ? (a[k] as number) : NaN);
@@ -255,14 +256,19 @@ const useView = create<{
   constant: false,
 }));
 
-/** Reload the folder's curves from its sidecars; an answer for a folder no longer open is dropped. */
-const loadCurves = (folder: string) =>
-  invoke<Curves>('glidelapse_curves', { folder }).then(
+/** Reload the folder's curves from its sidecars; an answer for a folder no longer open, or one
+ * overtaken by a later request, is dropped. */
+let curvesRequest = 0;
+const loadCurves = (folder: string) => {
+  const request = ++curvesRequest;
+  return invoke<Curves>('glidelapse_curves', { folder }).then(
     (data) => {
-      if (useLibraryStore.getState().currentFolderPath === folder) useView.setState({ curves: { folder, data } });
+      if (request === curvesRequest && useLibraryStore.getState().currentFolderPath === folder)
+        useView.setState({ curves: { folder, data } });
     },
     (e) => say(String(e)),
   );
+};
 
 /** Load the brightness grid that came with preview `p`, checked against its size. */
 const loadGrid = (p: Preview) =>
@@ -379,10 +385,11 @@ function PreviewView({
   const v = useView();
   const aspect = fb.size[0] / fb.size[1];
   const n = preview.count;
-  const anchors = stored?.anchors ?? [];
-  // the area being dragged, and an edited area waiting for "moving or all frames"
+  const anchors = stored?.anchors ?? NO_ANCHORS;
+  // the area being dragged, and an edited area waiting for "moving or all frames" with the frame
+  // it was drawn on (the playhead may move on before the choice is made)
   const [draft, setDraft] = useState<Area | null>(null);
-  const [choice, setChoice] = useState<Area | null>(null);
+  const [choice, setChoice] = useState<Anchor | null>(null);
   const drag = useRef<{
     id: number;
     mode: 'draw' | 'move' | 'size';
@@ -391,14 +398,13 @@ function PreviewView({
     dx: number;
     dy: number;
   } | null>(null);
-  // with a draft or a pending choice, the frame on show has that area
-  const shownAnchors = (() => {
-    const a = draft ?? choice;
-    if (!a) return anchors;
-    return [...anchors.filter((x) => x.frame !== fb.frame), { frame: fb.frame, area: a }].sort(
-      (p, q) => p.frame - q.frame,
-    );
-  })();
+  // the anchors with the draft (on the frame on show) or the pending choice (on its own frame)
+  const draftFrame = draft ? fb.frame : -1;
+  const shownAnchors = useMemo(() => {
+    const edit = draft ? { frame: draftFrame, area: draft } : choice;
+    if (!edit) return anchors;
+    return [...anchors.filter((x) => x.frame !== edit.frame), edit].sort((p, q) => p.frame - q.frame);
+  }, [anchors, draft, draftFrame, choice]);
   const area = areaAt(shownAnchors, fb.frame);
   const isAnchor = anchors.some((a) => a.frame === fb.frame);
 
@@ -420,21 +426,25 @@ function PreviewView({
   // the curves: brightness inside each frame's area from the grid, without and with the deflicker
   // the preview was rendered with, and the target deflicker would aim for
   const grid = v.grid?.gen === preview.gen ? v.grid.data : null;
-  const shown = (() => {
+  // (all memoised: playback re-renders this 25 times a second)
+  const shown = useMemo(() => {
     if (!grid || !shownAnchors.length || !v.showCurves) return null;
     return Array.from({ length: n }, (_, i) => {
       const a = areaAt(shownAnchors, i)!;
       const [w, h] = preview.sizes[preview.size_of[i] ?? 0] ?? [1, 1];
       return gridMean(grid, preview.grid, i, a, w, h);
     });
-  })();
-  const before = shown?.map((y, i) => withoutCorrection(y, preview.deflicker[i] ?? 0)) ?? null;
+  }, [grid, shownAnchors, v.showCurves, n, preview]);
+  const before = useMemo(
+    () => shown?.map((y, i) => withoutCorrection(y, preview.deflicker[i] ?? 0)) ?? null,
+    [shown, preview],
+  );
   const corrected = preview.deflicker.some((d) => d !== 0);
-  const target = (() => {
+  const target = useMemo(() => {
     if (!before || before.some((y) => !Number.isFinite(y))) return null;
-    if (v.constant) return before.map(() => before.reduce((s, y) => s + y, 0) / n);
+    if (v.constant) return new Array<number>(n).fill(before.reduce((s, y) => s + y, 0) / n);
     return loess(before, v.smoothing);
-  })();
+  }, [before, v.constant, v.smoothing, n]);
 
   // the grade's numbers in preview order
   const curves = v.curves?.folder === preview.folder ? v.curves.data : null;
@@ -493,7 +503,7 @@ function PreviewView({
       const next = [...anchors.filter((p) => p.frame !== fb.frame), { frame: fb.frame, area: a }];
       onStore({ anchors: next.sort((p, q) => p.frame - q.frame), geometry: preview.geometry });
     } else {
-      setChoice(a);
+      setChoice({ frame: fb.frame, area: a });
     }
   };
   const end = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -711,8 +721,8 @@ function PreviewView({
               <Text variant={TextVariants.small}>{t('editor.timelapse.anchorChoice')}</Text>
               <Button
                 onClick={() => {
-                  const next = [...anchors, { frame: fb.frame, area: choice }].sort((p, q) => p.frame - q.frame);
-                  onStore({ anchors: next, geometry: preview.geometry });
+                  const next = [...anchors.filter((p) => p.frame !== choice.frame), choice];
+                  onStore({ anchors: next.sort((p, q) => p.frame - q.frame), geometry: preview.geometry });
                   setChoice(null);
                 }}
               >
@@ -720,7 +730,7 @@ function PreviewView({
               </Button>
               <Button
                 onClick={() => {
-                  onStore({ anchors: [{ frame: fb.frame, area: choice }], geometry: preview.geometry });
+                  onStore({ anchors: [choice], geometry: preview.geometry });
                   setChoice(null);
                 }}
               >
@@ -848,21 +858,24 @@ export default function TimelapsePanel() {
   }, [folder, mine]);
   useEffect(() => {
     let timer = 0;
-    const off = useEditorStore.subscribe((s, old) => {
-      if (s.adjustments === old.adjustments) return;
+    const later = () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         const f = useLibraryStore.getState().currentFolderPath;
         if (f && !useRun.getState().busy && useRun.getState().preview?.folder === f) loadCurves(f);
       }, 2000);
-    });
+    };
+    const offEdits = useEditorStore.subscribe((s, old) => s.adjustments !== old.adjustments && later());
+    // stars are the keyframes
+    const offStars = useLibraryStore.subscribe((s, old) => s.imageRatings !== old.imageRatings && later());
     return () => {
-      off();
+      offEdits();
+      offStars();
       window.clearTimeout(timer);
     };
   }, []);
   // deflicker needs the area big enough on every frame (glidelapse would refuse it)
-  const tooSmall = (() => {
+  const tooSmall = useMemo(() => {
     if (!mine || !stored) return -1;
     for (let i = 0; i < mine.count; i++) {
       const a = areaAt(stored.anchors, i)!;
@@ -870,7 +883,7 @@ export default function TimelapsePanel() {
       if (pixelsIn(a, w, h) < 300) return i;
     }
     return -1;
-  })();
+  }, [mine, stored]);
 
   /** Runs the steps in order, then `after` while still busy (no other action can start before it
    * is done); true when all steps finished. */
@@ -953,8 +966,8 @@ export default function TimelapsePanel() {
         <Text variant={TextVariants.title}>{t('editor.timelapse.title')}</Text>
       </div>
       <div className="grow overflow-y-auto p-3 custom-scrollbar flex flex-col gap-2">
-        {mine && !view.poppedOut && <PreviewView preview={mine} stored={stored} onStore={store} />}
-        {mine && view.poppedOut && <PopOut preview={mine} stored={stored} onStore={store} />}
+        {mine && !view.poppedOut && <PreviewView key={mine.gen} preview={mine} stored={stored} onStore={store} />}
+        {mine && view.poppedOut && <PopOut key={mine.gen} preview={mine} stored={stored} onStore={store} />}
         {preview?.folder === folder && preview.outdated && (
           <Text variant={TextVariants.small}>{t('editor.timelapse.previewOutdated')}</Text>
         )}
