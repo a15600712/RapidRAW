@@ -29,6 +29,7 @@ export const FILENAME_VARIABLES: Array<string> = [
   '{DD}',
   '{hh}',
   '{mm}',
+  '{ss}',
 ];
 
 const UNIQUE_FILENAME_VARIABLES: Array<string> = ['{original_filename}', '{original_filename_number}', '{sequence}'];
@@ -37,6 +38,9 @@ export const isUniqueFilenameTemplate = (template: string): boolean =>
   UNIQUE_FILENAME_VARIABLES.some((variable) => template.includes(variable));
 
 export type TiffBitDepth = 8 | 16;
+
+export const DEFAULT_EXPORT_DPI = 96;
+export const MAX_EXPORT_DPI = 65535;
 
 export interface ExportSettings {
   filenameTemplate: string | null;
@@ -63,9 +67,14 @@ export interface ExportSettings {
   stripGps: boolean;
   watermark: WatermarkSettings | null;
   exportMasks?: boolean;
+  exportOriginal?: {
+    crop: boolean;
+    keepExposure: boolean;
+  } | null;
   preserveFolders?: boolean;
   destinationType?: string;
   subfolder?: string;
+  dpi?: number;
 }
 
 export enum BorderBasis {
@@ -95,6 +104,7 @@ interface WatermarkSettings {
 }
 
 export interface ExportState {
+  destination?: string | null;
   errorMessage: string;
   progress: Progress;
   status: Status;
@@ -107,6 +117,7 @@ export interface FileFormat {
 }
 
 export interface ImportState {
+  destination?: string | null;
   errorMessage: string;
   path?: string;
   progress?: Progress;
@@ -129,6 +140,7 @@ export interface ExportPreset {
   fileFormat: string;
   jpegQuality: number;
   tiffBitDepth?: TiffBitDepth;
+  dpi?: number;
   enableResize: boolean;
   resizeMode: string;
   resizeValue: number;
@@ -146,6 +158,9 @@ export interface ExportPreset {
   preserveTimestamps: boolean;
   stripGps: boolean;
   exportMasks?: boolean;
+  exportOriginal?: boolean;
+  originalCrop?: boolean;
+  originalKeepExposure?: boolean;
   preserveFolders?: boolean;
   filenameTemplate: string;
   enableWatermark: boolean;

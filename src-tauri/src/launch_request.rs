@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 use tauri::Emitter;
 
-use crate::export_processing::TiffBitDepth;
+use crate::export_processing::{OriginalExportOptions, TiffBitDepth};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +27,7 @@ pub struct HeadlessExportSession {
     pub max_size: Option<u32>,
     /// GlideLapse: keep the reduced images there for reuse (`--cache-dir`, with `--max-size`).
     pub cache_dir: Option<String>,
+    pub export_original: Option<OriginalExportOptions>,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +37,23 @@ pub enum LaunchRequest {
     EditSession(ExternalEditSession),
     HeadlessExport(HeadlessExportSession),
     InvalidHeadless(String),
+}
+
+static PROCESS_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+
+pub fn set_process_exit_code(code: i32) {
+    PROCESS_EXIT_CODE.store(code, Ordering::SeqCst);
+}
+
+pub fn process_exit_code() -> i32 {
+    PROCESS_EXIT_CODE.load(Ordering::SeqCst)
+}
+
+pub fn resolve_exit_code(requested: Option<i32>, recorded: i32) -> i32 {
+    match requested {
+        Some(code) if code != 0 => code,
+        _ => recorded,
+    }
 }
 
 #[derive(Serialize, Default)]
@@ -57,6 +76,9 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
         let mut adjustments_override = None;
         let mut max_size = None;
         let mut cache_dir = None;
+        let mut export_original = false;
+        let mut original_crop = true;
+        let mut original_keep_exposure = false;
 
         if let Some(src) = iter.next()
             && !src.starts_with('-')
@@ -102,6 +124,9 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
                     tiff_bit_depth = value;
                 }
                 "--keep-metadata" => keep_metadata = true,
+                "--export-original" => export_original = true,
+                "--original-no-crop" => original_crop = false,
+                "--original-keep-exposure" => original_keep_exposure = true,
                 "--adjustments" => {
                     if let Some(adj) = iter.next() {
                         adjustments_override = Some(adj.clone());
@@ -140,6 +165,10 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
             adjustments_override,
             max_size,
             cache_dir,
+            export_original: export_original.then_some(OriginalExportOptions {
+                crop: original_crop,
+                keep_exposure: original_keep_exposure,
+            }),
         });
     }
 
@@ -186,6 +215,27 @@ pub fn parse_launch_args(args: &[String]) -> LaunchRequest {
             Some(path) => LaunchRequest::OpenFile(path),
             None => LaunchRequest::None,
         },
+    }
+}
+
+pub fn resolve_gui_launch_paths(request: LaunchRequest, cwd: &Path) -> LaunchRequest {
+    let resolve = |path: String| {
+        if path.is_empty() || Path::new(&path).is_absolute() || !cwd.is_absolute() {
+            return path;
+        }
+        let joined = cwd.join(&path);
+        std::path::absolute(&joined)
+            .unwrap_or(joined)
+            .to_string_lossy()
+            .into_owned()
+    };
+    match request {
+        LaunchRequest::OpenFile(path) => LaunchRequest::OpenFile(resolve(path)),
+        LaunchRequest::EditSession(mut session) => {
+            session.source = resolve(session.source);
+            LaunchRequest::EditSession(session)
+        }
+        other => other,
     }
 }
 

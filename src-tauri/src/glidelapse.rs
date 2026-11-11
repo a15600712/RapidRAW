@@ -3,18 +3,18 @@
 //! `RapidRAW export <folder|file> --output <dir> --max-size <px>` renders every image from its
 //! own sidecar at most `<px>` on the long edge, all in this one process with the GPU kept warm:
 //! the image is decoded and composited exactly as export does it (full RAW development with its
-//! highlight headroom, saved AI patches), then reduced before the GPU, with masks generated at the
-//! reduced size the way the export-size estimate does. Frames with colour or luminance masks,
-//! which sample the full-size image, are rendered by the export pipeline itself and reduced
-//! afterwards. Each result is written as a 16-bit TIFF `<dir>/<file name>.tiff`. GlideLapse's
-//! deflicker measures whole sequences this way instead of one full-size export per frame.
+//! highlight headroom, saved AI patches), then reduced before the GPU, which renders it as export
+//! renders an image too large for it: geometry, crop and masks at the reduced scale. Frames with
+//! colour or luminance masks, which sample the full-size image, are rendered by the export
+//! pipeline itself and reduced afterwards. Each result is written as a 16-bit TIFF
+//! `<dir>/<file name>.tiff`. GlideLapse's deflicker measures whole sequences this way instead of
+//! one full-size export per frame.
 //!
-//! With `--cache-dir <dir>` the reduced image before the GPU (decoded, composited, geometry
-//! applied) is kept there and reused when the same file is rendered again with the same settings
-//! and the same adjustments apart from masks: the deflicker renders every frame several times
-//! with only its correction mask changed, so the RAW is decoded once instead of every pass.
+//! With `--cache-dir <dir>` the reduced image before the GPU (decoded and composited) is kept
+//! there and reused when the same file is rendered again with the same settings and the same
+//! adjustments apart from masks: the deflicker renders every frame several times with only its
+//! correction mask changed, so the RAW is decoded once instead of every pass.
 
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, GenericImageView, ImageBuffer, imageops::FilterType};
@@ -23,7 +23,6 @@ use tauri::Manager;
 
 use crate::AppState;
 use crate::app_settings::AppSettings;
-use crate::cache_utils::calculate_full_job_hash;
 use crate::exif_processing::load_sidecar;
 use crate::file_management::parse_virtual_path;
 use crate::formats::is_raw_file;
@@ -34,9 +33,10 @@ use crate::image_processing::{
     process_and_get_dynamic_image_with_precision, resolve_render_options,
 };
 use crate::lut_processing::get_or_load_lut;
-use crate::mask_generation::MaskDefinition;
+use crate::mask_generation::{MaskDefinition, generate_mask_bitmap};
+use crate::render_source::{RenderSource, source_id};
 use crate::as_shot::as_shot;
-use crate::{apply_all_transformations, get_cached_or_generate_mask, load_settings};
+use crate::load_settings;
 
 /// Render `paths` at most `max_dim` px into `output`; one failed image does not stop the rest.
 pub async fn run_reduced_export(
@@ -101,12 +101,13 @@ pub async fn run_reduced_export(
     Ok(())
 }
 
-/// The image the GPU starts from: decoded, composited, geometry applied, reduced; with the scale
-/// and crop offset the masks need at that size.
+/// The image the GPU starts from: decoded, composited, reduced; `scale` is its size relative to
+/// the original, whose pixels the crop and the masks are kept in, and `extent` the original's long
+/// edge at that scale (what export hands the depth map of a motion blur).
 struct Base {
     image: DynamicImage,
-    gpu_scale: f32,
-    crop_offset: (f32, f32),
+    scale: f32,
+    extent: f32,
 }
 
 /// One image from its sidecar at most `max_dim` px on the long edge, 16-bit.
@@ -151,39 +152,39 @@ fn render_reduced(
         });
     }
 
-    let cache = cache_dir.and_then(|d| Some(d.join(cache_key(&source, &js_adjustments, max_dim, settings)?)));
+    // AI denoise comes out of a cache of its own, which the key below cannot see: no entry then
+    let cache = cache_dir
+        .filter(|_| !crate::ai_denoise::is_enabled(&js_adjustments))
+        .and_then(|d| Some(d.join(cache_key(&source, &js_adjustments, max_dim, settings)?)));
     let base = match cache.as_deref().and_then(read_base) {
         Some(base) => base,
         None => {
-            let base = reduce(&source, &js_adjustments, max_dim, settings)?;
+            let base = reduce(path, &source, &js_adjustments, max_dim, context.limits.max_texture_dimension_2d, settings)?;
+            let (bw, bh) = base.image.dimensions();
+            // ponytail: the crop happens on the GPU, so a cropped frame's entry is larger than its
+            // render; one beyond twice `max_dim` squared (what GlideLapse reserves disk space for:
+            // a 3:2 frame cropped to under 58 % of its long edge) is not kept and that frame is
+            // decoded every pass. Crop before caching if that hurts.
+            let fits = u64::from(bw) * u64::from(bh) <= 2 * u64::from(max_dim) * u64::from(max_dim);
             if let Some(c) = &cache
-                && let Err(e) = write_base(c, &base)
+                && let Err(e) = if fits { write_base(c, &base) } else { Err("cropped too far for the cache".into()) }
             {
                 cli_eprintln!("{}: not cached: {}", source, e);
             }
             base
         }
     };
-    let (bw, bh) = base.image.dimensions();
-    let (gpu_scale, crop_offset) = (base.gpu_scale, base.crop_offset);
+    // from here as export (process_image_for_export_pipeline), on the reduced image
+    let render_source =
+        RenderSource::edited(&base.image, source_id("glidelapse", path, &js_adjustments), path, &js_adjustments)
+            .scaled(base.scale);
+    let crop_offset = render_source.crop_offset();
+    let (w, h) = render_source.size();
     let mask_bitmaps: Vec<_> = mask_definitions
         .iter()
-        .filter_map(|def| {
-            get_cached_or_generate_mask(
-                state,
-                &source,
-                def,
-                bw,
-                bh,
-                gpu_scale,
-                crop_offset,
-                &js_adjustments,
-            )
-        })
+        .filter_map(|def| generate_mask_bitmap(def, w, h, base.scale, crop_offset, None))
         .collect();
 
-    // as export: the as-shot white balance and baseline exposure, the tone mapper and baseline
-    // settings
     let mut adjustments = get_all_adjustments_from_json(
         &js_adjustments,
         is_raw,
@@ -194,18 +195,25 @@ fn render_reduced(
     let lut = js_adjustments["lutPath"]
         .as_str()
         .and_then(|p| get_or_load_lut(state, p).ok());
-    let job_hash = calculate_full_job_hash(&source, &js_adjustments).wrapping_add(2);
 
     process_and_get_dynamic_image_with_precision(
         context,
         state,
-        &base.image,
-        job_hash,
+        &render_source,
         RenderRequest {
             adjustments,
             mask_bitmaps: &mask_bitmaps,
+            mask_cache_key: None,
             lut,
             roi: None,
+            hsl_probe: false,
+            motion_blur: crate::motion_blur::MotionBlurs::new(
+                path,
+                &js_adjustments,
+                (w, h),
+                crop_offset,
+                base.extent,
+            ),
         },
         "glidelapse_reduced_export",
         RenderOutputPrecision::SixteenBit,
@@ -219,26 +227,26 @@ fn decode(source: &str, js_adjustments: &Value, settings: &AppSettings) -> Resul
     load_and_composite(&bytes, source, js_adjustments, false, settings, None).map_err(|e| e.to_string())
 }
 
-/// Decode, apply the geometry, reduce to at most `max_dim` before the GPU.
-fn reduce(source: &str, js_adjustments: &Value, max_dim: u32, settings: &AppSettings) -> Result<Base, String> {
+/// Decode, then reduce so that the render (after the crop) is at most `max_dim` px on its long
+/// edge, give or take the pixel a crop reaching past the image edge rounds to, and the image
+/// itself no larger than `gpu_limit`, the largest texture the GPU takes (export's `fit_to_gpu`).
+fn reduce(path: &str, source: &str, js_adjustments: &Value, max_dim: u32, gpu_limit: u32, settings: &AppSettings) -> Result<Base, String> {
     let original = decode(source, js_adjustments, settings)?;
-    let (transformed, unscaled_crop_offset) =
-        apply_all_transformations(Cow::Borrowed(&original), js_adjustments);
-    let (w, h) = transformed.dimensions();
-    if w.max(h) > max_dim && (u64::from(w.min(h)) * u64::from(max_dim)) < u64::from(w.max(h)) {
+    let long = original.width().max(original.height());
+    // the size export would render this image at
+    let (w, h) = RenderSource::edited(&original, 0, path, js_adjustments).size();
+    if w.max(h) > max_dim && u64::from(w.min(h)) * u64::from(max_dim) < u64::from(w.max(h)) {
         return Err(format!("{}x{} is too thin to reduce to {} px", w, h, max_dim));
     }
-    let image = if w > max_dim || h > max_dim {
-        downscale_f32_image(transformed.as_ref(), max_dim, max_dim)
-    } else {
-        transformed.into_owned()
-    };
-    let gpu_scale = if w > 0 { image.width() as f32 / w as f32 } else { 1.0 };
-    Ok(Base {
-        image,
-        gpu_scale,
-        crop_offset: (unscaled_crop_offset.0 * gpu_scale, unscaled_crop_offset.1 * gpu_scale),
-    })
+    let by = (f64::from(max_dim) / f64::from(w.max(h).max(1))).min(f64::from(gpu_limit) / f64::from(long.max(1)));
+    if by >= 1.0 {
+        return Ok(Base { image: original, scale: 1.0, extent: long as f32 });
+    }
+    // rounded down: never larger than asked for
+    let fit = |side: u32| ((f64::from(side) * by) as u32).max(1);
+    let image = downscale_f32_image(&original, fit(original.width()), fit(original.height()));
+    let scale = image.width() as f32 / original.width() as f32;
+    Ok(Base { image, scale, extent: long as f32 * scale })
 }
 
 /// Cache file name. Everything the reduced image depends on: this RapidRAW build (a hash of
@@ -255,7 +263,7 @@ fn cache_key(source: &str, js_adjustments: &Value, max_dim: u32, settings: &AppS
     let mut adjustments = js_adjustments.clone();
     adjustments.as_object_mut()?.remove("masks");
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"glidelapse-base-3\0");
+    hasher.update(b"glidelapse-base-5\0");
     hasher.update(build.as_ref()?.as_bytes());
     hasher.update(Path::new(source).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default().as_bytes());
     for n in [file.dev(), file.ino(), file.size(), file.mtime() as u64, file.mtime_nsec() as u64, file.ctime() as u64, file.ctime_nsec() as u64] {
@@ -286,9 +294,9 @@ fn cache_key(_: &str, _: &Value, _: u32, _: &AppSettings) -> Option<String> {
     None
 }
 
-const MAGIC: &[u8; 4] = b"GLB3";
-/// Magic, width, height, gpu scale, crop offset x/y, then BLAKE3 of all of those and the pixels.
-const FIELDS: usize = 4 + 4 * 5;
+const MAGIC: &[u8; 4] = b"GLB5";
+/// Magic, width, height, scale, extent, then BLAKE3 of all of those and the pixels.
+const FIELDS: usize = 4 + 4 * 4;
 const HEADER: usize = FIELDS + 32;
 
 fn checksum(fields: &[u8], payload: &[u8]) -> blake3::Hash {
@@ -306,9 +314,8 @@ fn write_base(path: &Path, base: &Base) -> Result<(), String> {
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&pixels.width().to_ne_bytes());
     bytes.extend_from_slice(&pixels.height().to_ne_bytes());
-    for v in [base.gpu_scale, base.crop_offset.0, base.crop_offset.1] {
-        bytes.extend_from_slice(&v.to_ne_bytes());
-    }
+    bytes.extend_from_slice(&base.scale.to_ne_bytes());
+    bytes.extend_from_slice(&base.extent.to_ne_bytes());
     let sum = checksum(&bytes, payload);
     bytes.extend_from_slice(sum.as_bytes());
     bytes.extend_from_slice(payload);
@@ -331,11 +338,10 @@ fn read_base(path: &Path) -> Option<Base> {
         return None;
     }
     let (w, h) = (u32::from_ne_bytes(word(4)?), u32::from_ne_bytes(word(8)?));
-    let f = |i: usize| Some(f32::from_ne_bytes(word(i)?));
-    let (gpu_scale, x, y) = (f(12)?, f(16)?, f(20)?);
+    let (scale, extent) = (f32::from_ne_bytes(word(12)?), f32::from_ne_bytes(word(16)?));
     let payload = bytes.get(HEADER..)?;
     let expected = usize::try_from(u64::from(w) * u64::from(h) * 12).ok()?;
-    if w == 0 || h == 0 || payload.len() != expected || !gpu_scale.is_finite() || !x.is_finite() || !y.is_finite() {
+    if w == 0 || h == 0 || payload.len() != expected || !scale.is_finite() || scale <= 0.0 || !extent.is_finite() {
         return None;
     }
     if checksum(bytes.get(..FIELDS)?, payload).as_bytes() != bytes.get(FIELDS..HEADER)? {
@@ -343,7 +349,7 @@ fn read_base(path: &Path) -> Option<Base> {
     }
     let data: Vec<f32> = bytemuck::pod_collect_to_vec(payload);
     let pixels = ImageBuffer::from_raw(w, h, data)?;
-    Some(Base { image: DynamicImage::ImageRgb32F(pixels), gpu_scale, crop_offset: (x, y) })
+    Some(Base { image: DynamicImage::ImageRgb32F(pixels), scale, extent })
 }
 
 /// The running GlideLapse action's process group, so the panel can stop it and the RapidRAW
@@ -402,6 +408,12 @@ const WRITERS: &[&str] = &[
     "reset_adjustments_for_paths",
     "apply_auto_lens_correction_to_paths",
     "apply_auto_adjustments_to_paths",
+    "apply_auto_straighten_to_paths",
+    // the AI job queue saves its masks into sidecars; "edit in" adds a file with a copied sidecar
+    "queue_ai_jobs",
+    "resume_ai_jobs",
+    "retry_failed_ai_jobs",
+    "edit_in_app",
     "clear_all_sidecars",
     "set_color_label_for_paths",
     "set_rating_for_paths",
@@ -422,9 +434,14 @@ const WRITERS: &[&str] = &[
     "delete_folder",
     "rename_folder",
     "import_files",
-    // reading can write too: EXIF repair and XMP sync rewrite sidecars while loading them
+    // reading can write too: EXIF repair and XMP sync rewrite sidecars while loading or listing
+    // them (the library's background EXIF loading keeps asking during an action)
     "load_metadata",
     "load_image",
+    "read_exif_for_paths",
+    "list_images_in_dir",
+    "list_images_recursive",
+    "get_album_images",
 ];
 // ponytail: refuses new writes only; a paste or AI indexing already running when an action starts
 // can still finish its own writes. Start actions when RapidRAW is idle.

@@ -4,14 +4,14 @@ This is RapidRAW (AGPL-3.0, by CyberTimon and contributors) with a small additio
 [GlideLapse](https://github.com/a15600712/glidelapse), a timelapse grading tool that works on
 RapidRAW sidecars. Branch `glidelapse`; everything else follows upstream.
 
-Changes (2026-10-13/14, on top of v1.6.5):
+Changes (2026-10-13/14; on v1.6.9 since 2026-11-11):
 
 - `src-tauri/src/glidelapse.rs` (new): headless `export ... --max-size <px>` renders every image
   from its own sidecar at most `<px>` on the long edge, all in one process with the GPU kept warm.
   Images are decoded and composited exactly as export does it (full RAW development with its
-  highlight headroom, saved AI patches), reduced before the GPU, and their masks generated at the
-  reduced size; images with colour or luminance masks go through the export pipeline itself and
-  are reduced afterwards. Results are 16-bit TIFFs `<output>/<file name>.tiff`; duplicate file
+  highlight headroom, saved AI patches), reduced before the GPU, and rendered the way export
+  renders an image too large for the GPU (geometry, crop and masks at the reduced scale); images
+  with colour or luminance masks go through the export pipeline itself and are reduced afterwards. Results are 16-bit TIFFs `<output>/<file name>.tiff`; duplicate file
   names, `--adjustments` together with `--max-size`, and crops too thin to reduce are refused.
 - `--cache-dir <dir>` (with `--max-size`): keeps each image's reduced pre-GPU image there and
   reuses it when the same file is rendered again with the same decoding settings and the same
@@ -31,8 +31,8 @@ Changes (2026-10-13/14, on top of v1.6.5):
   new commands `glidelapse_run` / `glidelapse_cancel` (`glidelapse.rs`). While it runs an overlay
   (rendered by `App.tsx`) blocks the window and its keyboard shortcuts, and RapidRAW's
   sidecar-writing commands are refused (`glidelapse::guarded` wraps the command handler in
-  `lib.rs`); afterwards `App.tsx` reopens the folder. New UI texts are in all locale files
-  (English).
+  `lib.rs`); afterwards `App.tsx` reopens the folder. New UI texts are in `en.json` only; the
+  other languages fall back to it.
 - `launch_request.rs`: parses `--max-size` and `--cache-dir`; `export_processing.rs`: hands such
   exports to the
   module above and lets it call the export pipeline; `lib.rs`: declares it.
