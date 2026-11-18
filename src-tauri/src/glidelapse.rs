@@ -21,22 +21,22 @@ use image::{DynamicImage, GenericImageView, ImageBuffer, imageops::FilterType};
 use serde_json::Value;
 use tauri::Manager;
 
-use crate::AppState;
-use crate::app_settings::AppSettings;
-use crate::exif_processing::load_sidecar;
-use crate::file_management::parse_virtual_path;
-use crate::formats::is_raw_file;
-use crate::image_loader::load_and_composite;
-use crate::image_processing::{
-    GpuContext, RenderOutputPrecision, RenderRequest, downscale_f32_image,
-    get_all_adjustments_from_json, get_or_init_gpu_context,
-    process_and_get_dynamic_image_with_precision, resolve_render_options,
-};
-use crate::lut_processing::get_or_load_lut;
-use crate::mask_generation::{MaskDefinition, generate_mask_bitmap};
-use crate::render_source::{RenderSource, source_id};
-use crate::as_shot::as_shot;
-use crate::load_settings;
+use crate::app::settings::{AppSettings, load_settings};
+use crate::app::state::AppState;
+use crate::adjustments::lut_processing::get_or_load_lut;
+use crate::decode::as_shot::as_shot;
+use crate::decode::formats::is_raw_file;
+use crate::decode::image_loader::load_and_composite;
+use crate::library::sidecars::parse_virtual_path;
+use crate::masks::generation::{MaskDefinition, generate_mask_bitmap};
+use crate::metadata::sidecar::load_sidecar;
+use crate::render::gpu::context::{GpuContext, get_or_init_gpu_context};
+use crate::render::gpu::output::process_and_get_dynamic_image_with_precision;
+use crate::render::gpu::processor::{RenderOutputPrecision, RenderRequest};
+use crate::render::image_processing::downscale_f32_image;
+use crate::render::options::resolve_render_options;
+use crate::render::source::{RenderSource, source_id};
+use crate::render::uniforms::get_all_adjustments_from_json;
 
 /// Render `paths` at most `max_dim` px into `output`; one failed image does not stop the rest.
 pub async fn run_reduced_export(
@@ -102,8 +102,8 @@ pub async fn run_reduced_export(
 }
 
 /// The image the GPU starts from: decoded, composited, reduced; `scale` is its size relative to
-/// the original, whose pixels the crop and the masks are kept in, and `extent` the original's long
-/// edge at that scale (what export hands the depth map of a motion blur).
+/// the original, whose pixels the crop and the masks are kept in (AI upscale included), and
+/// `extent` its own long edge (what export hands the depth map of a motion blur).
 struct Base {
     image: DynamicImage,
     scale: f32,
@@ -124,7 +124,13 @@ fn render_reduced(
     let (source_path, sidecar_path) = parse_virtual_path(path);
     let source = source_path.to_string_lossy().to_string();
     let is_raw = is_raw_file(&source);
-    let js_adjustments: Value = load_sidecar(&sidecar_path).adjustments;
+    crate::ai::jobs::ensure_ready(app_handle, path)
+        .map_err(|e| format!("Failed to generate AI results for export: {}", e))?;
+    // as export resolves a sidecar: the user's default preset for an unedited image, saved patches
+    let mut js_adjustments: Value =
+        crate::adjustments::develop_defaults::resolve(&load_sidecar(&sidecar_path).adjustments, &source_path)
+            .into_owned();
+    crate::render::adjustment_utils::hydrate_adjustments(state, &mut js_adjustments);
     let mask_definitions: Vec<MaskDefinition> = js_adjustments
         .get("masks")
         .and_then(|m| serde_json::from_value(m.clone()).ok())
@@ -132,10 +138,11 @@ fn render_reduced(
 
     // colour and luminance masks sample the full-size image: render exactly as export, then reduce
     if mask_definitions.iter().any(MaskDefinition::requires_warped_image) {
-        let original = decode(&source, &js_adjustments, settings)?;
-        let full = crate::export_processing::process_image_for_export_pipeline(
+        let (original, base_scale) = decode(&source, &js_adjustments, settings)?;
+        let full = crate::export::process_image_for_export_pipeline(
             path,
             &original,
+            base_scale,
             &js_adjustments,
             context,
             state,
@@ -152,9 +159,9 @@ fn render_reduced(
         });
     }
 
-    // AI denoise comes out of a cache of its own, which the key below cannot see: no entry then
+    // AI denoise and upscale come out of caches of their own, which the key below cannot see
     let cache = cache_dir
-        .filter(|_| !crate::ai_denoise::is_enabled(&js_adjustments))
+        .filter(|_| !crate::ai::denoise::is_enabled(&js_adjustments) && !crate::ai::upscale::is_enabled(&js_adjustments))
         .and_then(|d| Some(d.join(cache_key(&source, &js_adjustments, max_dim, settings)?)));
     let base = match cache.as_deref().and_then(read_base) {
         Some(base) => base,
@@ -207,7 +214,7 @@ fn render_reduced(
             lut,
             roi: None,
             hsl_probe: false,
-            motion_blur: crate::motion_blur::MotionBlurs::new(
+            motion_blur: crate::effects::motion_blur::MotionBlurs::new(
                 path,
                 &js_adjustments,
                 (w, h),
@@ -222,7 +229,8 @@ fn render_reduced(
 
 /// Decoded and composited as export does it: full development keeps the highlight headroom that
 /// the fast demosaic clips at 1.0, and saved AI patches are applied at full size.
-fn decode(source: &str, js_adjustments: &Value, settings: &AppSettings) -> Result<DynamicImage, String> {
+/// Also returns the decoded image's size relative to the original (2 with AI upscale).
+fn decode(source: &str, js_adjustments: &Value, settings: &AppSettings) -> Result<(DynamicImage, f32), String> {
     let bytes = std::fs::read(source).map_err(|e| format!("{}: {}", source, e))?;
     load_and_composite(&bytes, source, js_adjustments, false, settings, None).map_err(|e| e.to_string())
 }
@@ -231,22 +239,22 @@ fn decode(source: &str, js_adjustments: &Value, settings: &AppSettings) -> Resul
 /// edge, give or take the pixel a crop reaching past the image edge rounds to, and the image
 /// itself no larger than `gpu_limit`, the largest texture the GPU takes (export's `fit_to_gpu`).
 fn reduce(path: &str, source: &str, js_adjustments: &Value, max_dim: u32, gpu_limit: u32, settings: &AppSettings) -> Result<Base, String> {
-    let original = decode(source, js_adjustments, settings)?;
+    let (original, up) = decode(source, js_adjustments, settings)?;
     let long = original.width().max(original.height());
     // the size export would render this image at
-    let (w, h) = RenderSource::edited(&original, 0, path, js_adjustments).size();
+    let (w, h) = RenderSource::edited(&original, 0, path, js_adjustments).scaled(up).size();
     if w.max(h) > max_dim && u64::from(w.min(h)) * u64::from(max_dim) < u64::from(w.max(h)) {
         return Err(format!("{}x{} is too thin to reduce to {} px", w, h, max_dim));
     }
     let by = (f64::from(max_dim) / f64::from(w.max(h).max(1))).min(f64::from(gpu_limit) / f64::from(long.max(1)));
     if by >= 1.0 {
-        return Ok(Base { image: original, scale: 1.0, extent: long as f32 });
+        return Ok(Base { image: original, scale: up, extent: long as f32 });
     }
     // rounded down: never larger than asked for
     let fit = |side: u32| ((f64::from(side) * by) as u32).max(1);
     let image = downscale_f32_image(&original, fit(original.width()), fit(original.height()));
-    let scale = image.width() as f32 / original.width() as f32;
-    Ok(Base { image, scale, extent: long as f32 * scale })
+    let reduced = image.width() as f32 / original.width() as f32;
+    Ok(Base { image, scale: reduced * up, extent: long as f32 * reduced })
 }
 
 /// Cache file name. Everything the reduced image depends on: this RapidRAW build (a hash of

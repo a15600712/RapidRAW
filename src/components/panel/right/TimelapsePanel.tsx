@@ -13,7 +13,7 @@ import { create } from 'zustand';
 import Button from '../../ui/Button';
 import Slider from '../../ui/Slider';
 import Text from '../../ui/Text';
-import { Invokes } from '../../ui/AppProperties';
+import { Invokes } from '../../../types/invokes';
 import { TextVariants } from '../../../types/typography';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useLibraryStore } from '../../../store/useLibraryStore';
